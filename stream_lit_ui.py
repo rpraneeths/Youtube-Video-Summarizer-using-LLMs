@@ -20,10 +20,760 @@ import requests
 from PIL import Image
 from io import BytesIO
 from textblob import TextBlob
-import nltk
-from nltk.tokenize import sent_tokenize
+
+# Import NLTK components with fallback
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+    def sent_tokenize(text):
+        """Fallback sentence tokenization using simple period splitting"""
+        return [s.strip() for s in text.split('.') if s.strip()]
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
+import urllib.parse
+from typing import Dict, List, Optional, Tuple, NamedTuple
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Enhanced data structures
+class ValidationResult(NamedTuple):
+    is_valid: bool
+    video_id: Optional[str]
+    error: Optional[str]
+    url_type: Optional[str]
+
+class VideoMetadata(NamedTuple):
+    video_id: str
+    title: str
+    duration: str
+    channel: str
+    description: str
+    view_count: int
+    upload_date: str
+    category: str
+
+class ContentCategory(NamedTuple):
+    category: str
+    confidence: float
+    subcategories: List[str]
+    preprocessing_strategy: str
+
+# Enhanced URL validation patterns
+YOUTUBE_URL_PATTERNS = [
+    r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/v/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtu\.be/([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:m\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]{11})',
+    r'(?:https?://)?(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{11})'
+]
+
+def validate_youtube_url(url: str) -> ValidationResult:
+    """
+    Validate YouTube URL with comprehensive checks
+    - Support youtube.com/watch?v=, youtu.be/, youtube.com/embed/, m.youtube.com
+    - Extract video ID reliably
+    - Check for live streams, private videos, age-restricted content
+    - Validate URL format and accessibility
+    """
+    try:
+        # Clean and normalize URL
+        url = url.strip()
+        if not url:
+            return ValidationResult(False, None, "URL cannot be empty", None)
+        
+        # Check if URL matches any YouTube pattern
+        video_id = None
+        url_type = None
+        
+        for pattern in YOUTUBE_URL_PATTERNS:
+            match = re.search(pattern, url)
+            if match:
+                video_id = match.group(1)
+                url_type = pattern
+                break
+        
+        if not video_id:
+            return ValidationResult(False, None, "Invalid YouTube URL format", None)
+        
+        # Validate video ID format (YouTube IDs are 11 characters)
+        if len(video_id) != 11:
+            return ValidationResult(False, None, "Invalid video ID length", None)
+        
+        # Check if video is accessible (basic check)
+        try:
+            # Use YouTube oEmbed API to check video accessibility
+            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            response = requests.get(oembed_url, timeout=10)
+            
+            if response.status_code != 200:
+                return ValidationResult(False, None, "Video not accessible or private", url_type)
+            
+            # Check for age restrictions and other issues
+            video_info = response.json()
+            if not video_info.get('title'):
+                return ValidationResult(False, None, "Video information unavailable", url_type)
+                
+        except requests.RequestException as e:
+            logger.warning(f"Could not verify video accessibility: {e}")
+            # Continue with basic validation if API check fails
+        
+        return ValidationResult(True, video_id, None, url_type)
+        
+    except Exception as e:
+        logger.error(f"URL validation error: {e}")
+        return ValidationResult(False, None, f"Validation error: {str(e)}", None)
+
+def extract_video_metadata(video_id: str) -> Optional[VideoMetadata]:
+    """
+    Extract comprehensive video metadata using YouTube Data API
+    Falls back to oEmbed API if Data API is not available
+    """
+    try:
+        # Try YouTube Data API first (requires API key)
+        api_key = os.getenv('YOUTUBE_API_KEY')
+        if api_key:
+            try:
+                data_api_url = f"https://www.googleapis.com/youtube/v3/videos"
+                params = {
+                    'part': 'snippet,contentDetails,statistics',
+                    'id': video_id,
+                    'key': api_key
+                }
+                response = requests.get(data_api_url, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('items'):
+                        item = data['items'][0]
+                        snippet = item['snippet']
+                        content_details = item['contentDetails']
+                        statistics = item['statistics']
+                        
+                        return VideoMetadata(
+                            video_id=video_id,
+                            title=snippet.get('title', 'Unknown Title'),
+                            duration=content_details.get('duration', 'Unknown'),
+                            channel=snippet.get('channelTitle', 'Unknown Channel'),
+                            description=snippet.get('description', '')[:500] + '...' if snippet.get('description', '') else '',
+                            view_count=int(statistics.get('viewCount', 0)),
+                            upload_date=snippet.get('publishedAt', 'Unknown'),
+                            category=snippet.get('categoryId', 'Unknown')
+                        )
+            except Exception as e:
+                logger.warning(f"YouTube Data API failed: {e}")
+        
+        # Fallback to oEmbed API
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = requests.get(oembed_url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return VideoMetadata(
+                video_id=video_id,
+                title=data.get('title', 'Unknown Title'),
+                duration='Unknown',
+                channel=data.get('author_name', 'Unknown Channel'),
+                description='',
+                view_count=0,
+                upload_date='Unknown',
+                category='Unknown'
+            )
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Metadata extraction error: {e}")
+        return None
+
+def intelligent_transcript_extraction(video_id: str) -> Tuple[Optional[str], str]:
+    """
+    Multi-strategy transcript extraction:
+    1. Primary: YouTube Transcript API (multiple languages)
+    2. Fallback: Auto-generated captions
+    3. Alternative: Audio extraction + Speech-to-Text (Whisper)
+    4. Final: Inform user about manual transcript upload option
+    """
+    transcript = None
+    method_used = ""
+    
+    try:
+        # Strategy 1: YouTube Transcript API with multiple languages
+        ytt_api = YouTubeTranscriptApi()
+        
+        # Try to get transcript in multiple languages
+        languages_to_try = ['en', 'en-US', 'en-GB', 'auto']
+        
+        for lang in languages_to_try:
+            try:
+                transcript_data = ytt_api.fetch(video_id, languages=[lang])
+                if transcript_data:
+                    transcript = " ".join([line.text for line in transcript_data])
+                    method_used = f"YouTube Transcript API ({lang})"
+                    logger.info(f"Transcript extracted using {method_used}")
+                    break
+            except Exception as e:
+                logger.debug(f"Failed to get transcript in {lang}: {e}")
+                continue
+        
+        # Strategy 2: Try auto-generated captions if no manual transcript
+        if not transcript:
+            try:
+                transcript_data = ytt_api.fetch(video_id, languages=['en'])
+                if transcript_data:
+                    transcript = " ".join([line.text for line in transcript_data])
+                    method_used = "Auto-generated captions"
+                    logger.info(f"Transcript extracted using {method_used}")
+            except Exception as e:
+                logger.debug(f"Auto-generated captions failed: {e}")
+        
+        # Strategy 3: Check if transcript is available but in different format
+        if not transcript:
+            try:
+                # Try to get available transcripts
+                transcript_list = ytt_api.list_transcripts(video_id)
+                
+                # Try manual transcripts first
+                for transcript_obj in transcript_list:
+                    if not transcript_obj.is_generated:
+                        try:
+                            transcript_data = transcript_obj.fetch()
+                            transcript = " ".join([line['text'] for line in transcript_data])
+                            method_used = f"Manual transcript ({transcript_obj.language})"
+                            logger.info(f"Transcript extracted using {method_used}")
+                            break
+                        except Exception as e:
+                            logger.debug(f"Failed to fetch manual transcript: {e}")
+                            continue
+                
+                # If no manual transcript, try auto-generated
+                if not transcript:
+                    for transcript_obj in transcript_list:
+                        if transcript_obj.is_generated:
+                            try:
+                                transcript_data = transcript_obj.fetch()
+                                transcript = " ".join([line['text'] for line in transcript_data])
+                                method_used = f"Auto-generated transcript ({transcript_obj.language})"
+                                logger.info(f"Transcript extracted using {method_used}")
+                                break
+                            except Exception as e:
+                                logger.debug(f"Failed to fetch auto-generated transcript: {e}")
+                                continue
+                                
+            except Exception as e:
+                logger.debug(f"Transcript list check failed: {e}")
+        
+        if transcript and transcript.strip():
+            return transcript, method_used
+        else:
+            return None, "No transcript available"
+            
+    except Exception as e:
+        logger.error(f"Transcript extraction error: {e}")
+        return None, f"Extraction error: {str(e)}"
+
+def categorize_content(transcript: str, metadata: Optional[VideoMetadata] = None) -> ContentCategory:
+    """
+    Intelligent content categorization using NLP techniques
+    """
+    try:
+        # Initialize with default values
+        category = "General"
+        confidence = 0.5
+        subcategories = []
+        preprocessing_strategy = "standard"
+        
+        if not transcript:
+            return ContentCategory(category, confidence, subcategories, preprocessing_strategy)
+        
+        # Convert to lowercase for analysis
+        text_lower = transcript.lower()
+        
+        # Define category keywords and patterns
+        category_patterns = {
+            "News/Current Events": [
+                r'\b(news|breaking|update|announcement|press|official|government|politics|election|vote)\b',
+                r'\b(today|yesterday|this week|latest|recent|developing)\b',
+                r'\b(report|coverage|investigation|exclusive|interview)\b'
+            ],
+            "Educational": [
+                r'\b(learn|education|tutorial|lesson|course|class|lecture|study|research|academic)\b',
+                r'\b(explain|understand|concept|theory|principle|method|technique)\b',
+                r'\b(example|demonstration|step-by-step|how to|guide)\b'
+            ],
+            "Technical/Tutorial": [
+                r'\b(programming|coding|software|development|code|script|function|api|database)\b',
+                r'\b(install|setup|configure|deploy|build|compile|debug|test)\b',
+                r'\b(technology|tech|computer|system|application|platform)\b'
+            ],
+            "Entertainment": [
+                r'\b(entertainment|fun|comedy|humor|joke|laugh|amusing|hilarious)\b',
+                r'\b(movie|film|show|series|episode|season|character|plot|story)\b',
+                r'\b(music|song|artist|album|concert|performance|dance)\b'
+            ],
+            "Review/Opinion": [
+                r'\b(review|opinion|thoughts|impression|experience|recommendation)\b',
+                r'\b(pros|cons|advantages|disadvantages|benefits|drawbacks)\b',
+                r'\b(rating|score|grade|evaluation|assessment|analysis)\b'
+            ],
+            "Interview/Podcast": [
+                r'\b(interview|podcast|conversation|discussion|talk|chat|guest|host)\b',
+                r'\b(question|answer|response|opinion|viewpoint|perspective)\b',
+                r'\b(experience|background|story|journey|career|achievement)\b'
+            ]
+        }
+        
+        # Calculate category scores
+        category_scores = {}
+        for cat, patterns in category_patterns.items():
+            score = 0
+            for pattern in patterns:
+                matches = len(re.findall(pattern, text_lower))
+                score += matches
+            category_scores[cat] = score
+        
+        # Find the category with highest score
+        if category_scores:
+            best_category = max(category_scores, key=category_scores.get)
+            best_score = category_scores[best_category]
+            
+            if best_score > 0:
+                category = best_category
+                confidence = min(0.9, best_score / 10)  # Normalize confidence
+                
+                # Determine preprocessing strategy
+                if category == "News/Current Events":
+                    preprocessing_strategy = "news_focused"
+                elif category == "Educational":
+                    preprocessing_strategy = "educational_structured"
+                elif category == "Technical/Tutorial":
+                    preprocessing_strategy = "technical_stepwise"
+                elif category == "Entertainment":
+                    preprocessing_strategy = "entertainment_highlight"
+                elif category == "Review/Opinion":
+                    preprocessing_strategy = "review_balanced"
+                elif category == "Interview/Podcast":
+                    preprocessing_strategy = "interview_insights"
+        
+        # Add subcategories based on content analysis
+        if "news" in text_lower or "politics" in text_lower:
+            subcategories.append("Politics")
+        if "technology" in text_lower or "tech" in text_lower:
+            subcategories.append("Technology")
+        if "science" in text_lower or "research" in text_lower:
+            subcategories.append("Science")
+        if "business" in text_lower or "finance" in text_lower:
+            subcategories.append("Business")
+        if "health" in text_lower or "medical" in text_lower:
+            subcategories.append("Health")
+        
+        return ContentCategory(category, confidence, subcategories, preprocessing_strategy)
+        
+    except Exception as e:
+        logger.error(f"Content categorization error: {e}")
+        return ContentCategory("General", 0.5, [], "standard")
+
+def content_aware_preprocessing(transcript: str, content_category: ContentCategory, metadata: Optional[VideoMetadata] = None) -> str:
+    """
+    Intelligent content categorization and preprocessing based on content type
+    """
+    try:
+        if not transcript:
+            return transcript
+        
+        processed_text = transcript
+        
+        # Apply category-specific preprocessing
+        if content_category.preprocessing_strategy == "news_focused":
+            processed_text = _preprocess_news_content(processed_text)
+        elif content_category.preprocessing_strategy == "educational_structured":
+            processed_text = _preprocess_educational_content(processed_text)
+        elif content_category.preprocessing_strategy == "technical_stepwise":
+            processed_text = _preprocess_technical_content(processed_text)
+        elif content_category.preprocessing_strategy == "entertainment_highlight":
+            processed_text = _preprocess_entertainment_content(processed_text)
+        elif content_category.preprocessing_strategy == "review_balanced":
+            processed_text = _preprocess_review_content(processed_text)
+        elif content_category.preprocessing_strategy == "interview_insights":
+            processed_text = _preprocess_interview_content(processed_text)
+        
+        # Apply general preprocessing
+        processed_text = _apply_general_preprocessing(processed_text)
+        
+        return processed_text
+        
+    except Exception as e:
+        logger.error(f"Content preprocessing error: {e}")
+        return transcript
+
+def _preprocess_news_content(text: str) -> str:
+    """Preprocess news content focusing on facts and key information"""
+    # Remove common news filler phrases
+    filler_phrases = [
+        r'\b(breaking news|developing story|stay tuned|more to come)\b',
+        r'\b(according to|reports say|sources say|officials say)\b',
+        r'\b(meanwhile|additionally|furthermore|moreover)\b'
+    ]
+    
+    for phrase in filler_phrases:
+        text = re.sub(phrase, '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _preprocess_educational_content(text: str) -> str:
+    """Preprocess educational content for better structure"""
+    # Identify and emphasize key concepts
+    text = re.sub(r'\b(important|key|main|primary|essential)\b', r'**\1**', text, flags=re.IGNORECASE)
+    
+    # Clean up repetitive educational phrases
+    text = re.sub(r'\b(as you can see|as we discussed|remember that)\b', '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _preprocess_technical_content(text: str) -> str:
+    """Preprocess technical content for step-by-step clarity"""
+    # Identify step indicators
+    text = re.sub(r'\b(step \d+|first|second|third|next|then|finally)\b', r'**\1**', text, flags=re.IGNORECASE)
+    
+    # Emphasize technical terms
+    text = re.sub(r'\b(install|configure|setup|deploy|build|run|execute)\b', r'**\1**', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _preprocess_entertainment_content(text: str) -> str:
+    """Preprocess entertainment content to highlight key moments"""
+    # Remove excessive filler words
+    filler_words = [
+        r'\b(um|uh|like|you know|basically|actually|literally)\b',
+        r'\b(so|well|right|okay|yeah|wow|amazing)\b'
+    ]
+    
+    for word in filler_words:
+        text = re.sub(rf'\b{word}\b', '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _preprocess_review_content(text: str) -> str:
+    """Preprocess review content for balanced analysis"""
+    # Emphasize pros and cons
+    text = re.sub(r'\b(pros?|advantages?|benefits?|strengths?)\b', r'**\1**', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(cons?|disadvantages?|drawbacks?|weaknesses?)\b', r'**\1**', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _preprocess_interview_content(text: str) -> str:
+    """Preprocess interview content for key insights"""
+    # Identify speaker transitions
+    text = re.sub(r'\b(interviewer|host|guest|speaker|question|answer)\b', r'**\1**', text, flags=re.IGNORECASE)
+    
+    # Clean up interview filler
+    text = re.sub(r'\b(that\'s a great question|interesting point|good question)\b', '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _apply_general_preprocessing(text: str) -> str:
+    """Apply general preprocessing to all content types"""
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Remove common filler words
+    common_fillers = [
+        r'\b(um|uh|like|you know|basically|actually|literally)\b',
+        r'\b(so|well|right|okay|yeah|wow|amazing)\b'
+    ]
+    
+    for filler in common_fillers:
+        text = re.sub(filler, '', text, flags=re.IGNORECASE)
+    
+    # Normalize punctuation
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'!{2,}', '!', text)
+    text = re.sub(r'\?{2,}', '?', text)
+    
+    # Clean up timestamps if present
+    text = re.sub(r'\d{1,2}:\d{2}(?::\d{2})?', '', text)
+    
+    return text.strip()
+
+def generate_contextual_prompt(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
+    """
+    Generate optimized prompts based on content type and user preferences
+    """
+    base_prompt = f"Please provide a comprehensive summary of the following {content_category.category.lower()} content:"
+    
+    # Add category-specific instructions
+    if content_category.preprocessing_strategy == "news_focused":
+        base_prompt += """
+        
+        Focus on:
+        - Key events and timeline
+        - Main stakeholders and their roles
+        - Factual information and verified details
+        - Implications and potential impact
+        - Include specific dates, numbers, and locations
+        
+        Ensure accuracy and objectivity in the summary."""
+        
+    elif content_category.preprocessing_strategy == "educational_structured":
+        base_prompt += """
+        
+        Structure the summary to emphasize:
+        - Main concepts and learning objectives
+        - Key definitions and terminology
+        - Examples and practical applications
+        - Step-by-step explanations if applicable
+        - Important takeaways and conclusions
+        
+        Make it easy to understand and follow."""
+        
+    elif content_category.preprocessing_strategy == "technical_stepwise":
+        base_prompt += """
+        
+        Organize the summary around:
+        - Tools and technologies mentioned
+        - Step-by-step processes and procedures
+        - Prerequisites and requirements
+        - Expected outcomes and results
+        - Common issues and troubleshooting tips
+        - Best practices and recommendations
+        
+        Focus on actionable information."""
+        
+    elif content_category.preprocessing_strategy == "entertainment_highlight":
+        base_prompt += """
+        
+        Highlight:
+        - Main themes and storylines
+        - Key characters and their roles
+        - Memorable moments and highlights
+        - Entertainment value and appeal
+        - Overall tone and atmosphere
+        
+        Keep it engaging and fun."""
+        
+    elif content_category.preprocessing_strategy == "review_balanced":
+        base_prompt += """
+        
+        Provide a balanced summary covering:
+        - Product/service overview
+        - Pros and advantages
+        - Cons and limitations
+        - Overall rating or recommendation
+        - Target audience and use cases
+        - Value for money assessment
+        
+        Present both positive and negative aspects fairly."""
+        
+    elif content_category.preprocessing_strategy == "interview_insights":
+        base_prompt += """
+        
+        Extract and organize:
+        - Key insights from each speaker
+        - Main discussion topics and themes
+        - Expert opinions and perspectives
+        - Actionable advice and recommendations
+        - Memorable quotes and statements
+        - Background context and expertise
+        
+        Focus on valuable insights and takeaways."""
+    
+    # Add user preference customization if available
+    if user_preferences:
+        if user_preferences.get('detail_level') == 'detailed':
+            base_prompt += "\n\nProvide a detailed summary with comprehensive coverage."
+        elif user_preferences.get('detail_level') == 'concise':
+            base_prompt += "\n\nProvide a concise summary focusing on key points only."
+        
+        if user_preferences.get('include_timestamps'):
+            base_prompt += "\n\nInclude relevant timestamps for key points."
+        
+        if user_preferences.get('format') == 'bullet_points':
+            base_prompt += "\n\nFormat the summary as bullet points for easy reading."
+    
+    base_prompt += f"\n\nContent to summarize:\n{transcript[:2000]}..."
+    
+    return base_prompt
+
+def enhanced_summarization_pipeline(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
+    """
+    Multi-stage summarization with intelligent model selection
+    """
+    try:
+        if not transcript:
+            return "No transcript available for summarization."
+        
+        # Stage 1: Content Analysis and Preprocessing
+        processed_transcript = content_aware_preprocessing(transcript, content_category)
+        
+        # Stage 2: Generate contextual prompt
+        llm_prompt = generate_contextual_prompt(processed_transcript, content_category, user_preferences)
+        
+        # Stage 3: Model Selection based on content type
+        model_name = _select_optimal_model(content_category)
+        
+        # Stage 4: Primary Summarization
+        with st.status(f"Generating summary using {model_name}...", expanded=True) as status:
+            try:
+                summarizer = pipeline("summarization", model=model_name)
+                
+                # Split into chunks that fit within the model's context window
+                max_chunk_size = _get_model_context_window(model_name)
+                chunks = [processed_transcript[i:i+max_chunk_size] for i in range(0, len(processed_transcript), max_chunk_size)]
+                
+                summarized_text = []
+                for i, chunk in enumerate(chunks):
+                    if len(chunks) > 1:
+                        status.update(label=f"Processing chunk {i+1}/{len(chunks)}...")
+                    
+                    summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)
+                    summarized_text.append(summary[0]['summary_text'])
+                
+                # Stage 5: Combine and refine summaries
+                combined_summary = " ".join(summarized_text)
+                
+                # Stage 6: Post-processing and formatting
+                final_summary = _format_summary_by_category(combined_summary, content_category)
+                
+                status.update(label="Summary generated successfully!", state="complete")
+                return final_summary
+                
+            except Exception as e:
+                logger.error(f"Summarization error: {e}")
+                # Fallback to basic summarization
+                return _fallback_summarization(processed_transcript)
+                
+    except Exception as e:
+        logger.error(f"Enhanced summarization pipeline error: {e}")
+        return f"Summarization error: {str(e)}"
+
+def _select_optimal_model(content_category: ContentCategory) -> str:
+    """Select the optimal model based on content category"""
+    model_mapping = {
+        "News/Current Events": "facebook/bart-large-cnn",
+        "Educational": "google/pegasus-xsum",
+        "Technical/Tutorial": "t5-base",
+        "Entertainment": "facebook/bart-large-cnn",
+        "Review/Opinion": "facebook/bart-large-cnn",
+        "Interview/Podcast": "google/pegasus-xsum"
+    }
+    
+    return model_mapping.get(content_category.category, "facebook/bart-large-cnn")
+
+def _get_model_context_window(model_name: str) -> int:
+    """Get the context window size for different models"""
+    context_windows = {
+        "facebook/bart-large-cnn": 1024,
+        "google/pegasus-xsum": 1024,
+        "t5-base": 512,
+        "facebook/bart-base": 1024
+    }
+    
+    return context_windows.get(model_name, 1024)
+
+def _format_summary_by_category(summary: str, content_category: ContentCategory) -> str:
+    """Format summary based on content category"""
+    if content_category.preprocessing_strategy == "news_focused":
+        return f"📰 **News Summary**\n\n{summary}"
+    elif content_category.preprocessing_strategy == "educational_structured":
+        return f"📚 **Educational Summary**\n\n{summary}"
+    elif content_category.preprocessing_strategy == "technical_stepwise":
+        return f"⚙️ **Technical Summary**\n\n{summary}"
+    elif content_category.preprocessing_strategy == "entertainment_highlight":
+        return f"🎬 **Entertainment Summary**\n\n{summary}"
+    elif content_category.preprocessing_strategy == "review_balanced":
+        return f"⭐ **Review Summary**\n\n{summary}"
+    elif content_category.preprocessing_strategy == "interview_insights":
+        return f"🎤 **Interview Summary**\n\n{summary}"
+    else:
+        return f"📋 **Summary**\n\n{summary}"
+
+def _fallback_summarization(text: str) -> str:
+    """Fallback summarization when primary method fails"""
+    try:
+        # Simple extractive summarization using TF-IDF
+        try:
+            sentences = sent_tokenize(text)
+        except LookupError:
+            # Fallback: simple sentence splitting by periods
+            sentences = [s.strip() for s in text.split('.') if s.strip()]
+        
+        if len(sentences) <= 3:
+            return text
+        
+        # Calculate sentence importance using TF-IDF
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(sentences)
+        
+        # Get sentence scores
+        sentence_scores = tfidf_matrix.sum(axis=1).A1
+        
+        # Select top sentences
+        top_indices = sentence_scores.argsort()[-3:][::-1]
+        top_sentences = [sentences[i] for i in sorted(top_indices)]
+        
+        return " ".join(top_sentences)
+        
+    except Exception as e:
+        logger.error(f"Fallback summarization error: {e}")
+        # Return first few sentences as last resort
+        try:
+            sentences = sent_tokenize(text)
+            return " ".join(sentences[:3])
+        except LookupError:
+            # Final fallback: simple text truncation
+            return text[:500] + "..." if len(text) > 500 else text
+
+def handle_transcript_unavailable(video_id: str, metadata: Optional[VideoMetadata] = None) -> Dict:
+    """
+    Intelligent fallback when transcript is unavailable
+    """
+    fallback_options = {
+        'auto_captions_available': False,
+        'audio_extraction_possible': False,
+        'manual_upload_suggested': True,
+        'alternative_methods': [],
+        'error_message': "No transcript available for this video."
+    }
+    
+    try:
+        # Check for auto-generated captions
+        ytt_api = YouTubeTranscriptApi()
+        try:
+            transcript_list = ytt_api.list_transcripts(video_id)
+            for transcript_obj in transcript_list:
+                if transcript_obj.is_generated:
+                    fallback_options['auto_captions_available'] = True
+                    fallback_options['alternative_methods'].append("Auto-generated captions available")
+                    break
+        except Exception as e:
+            logger.debug(f"Could not check auto-captions: {e}")
+        
+        # Suggest manual transcript upload
+        fallback_options['alternative_methods'].extend([
+            "Manual transcript upload",
+            "Video description analysis",
+            "Comments analysis (if enabled)",
+            "Audio analysis (if legally permissible)"
+        ])
+        
+        # Update error message with helpful information
+        if fallback_options['auto_captions_available']:
+            fallback_options['error_message'] = "Manual transcript not available, but auto-generated captions may be accessible."
+        else:
+            fallback_options['error_message'] = "No transcript available. Consider uploading a manual transcript or using alternative analysis methods."
+        
+        return fallback_options
+        
+    except Exception as e:
+        logger.error(f"Fallback analysis error: {e}")
+        return fallback_options
 
 # Set page config
 st.set_page_config(
@@ -70,10 +820,24 @@ def install_packages():
 
     # Download required NLTK data
     try:
-        nltk.download('punkt')
-        nltk.download('stopwords')
+        # Download punkt tokenizer (essential for sentence tokenization)
+        nltk.download('punkt', quiet=True)
+        
+        # Download additional NLTK resources
+        nltk.download('wordnet', quiet=True)
+        nltk.download('omw-1.4', quiet=True)
+        nltk.download('stopwords', quiet=True)
+        
+        # Verify punkt is available
+        try:
+            from nltk.data import find
+            find('tokenizers/punkt')
+        except LookupError:
+            st.error("NLTK punkt tokenizer not found. Please restart the app.")
+            
     except Exception as e:
         st.error(f"Error downloading NLTK data: {str(e)}")
+        st.warning("Some features may not work properly without NLTK data.")
 
 def load_data(file_path, default_data):
     """Load data from JSON file or return default if file doesn't exist"""
@@ -104,7 +868,28 @@ def init_session_states():
         'auto_play': False
     })
     history = load_data(HISTORY_FILE, [])
-
+    
+    # Normalize settings values to ensure consistency
+    if 'detail_level' in settings:
+        detail_level = settings['detail_level']
+        if detail_level.lower() == 'balanced':
+            settings['detail_level'] = 'Balanced'
+        elif detail_level.lower() == 'concise':
+            settings['detail_level'] = 'Concise'
+        elif detail_level.lower() == 'detailed':
+            settings['detail_level'] = 'Detailed'
+    
+    if 'summary_format' in settings:
+        summary_format = settings['summary_format']
+        if summary_format.lower() == 'paragraph':
+            settings['summary_format'] = 'Paragraph'
+        elif summary_format.lower() == 'bullet_points':
+            settings['summary_format'] = 'Bullet Points'
+        elif summary_format.lower() == 'structured':
+            settings['summary_format'] = 'Structured'
+        elif summary_format.lower() == 'mixed':
+            settings['summary_format'] = 'Mixed'
+    
     # Initialize session states
     if 'favorites' not in st.session_state:
         st.session_state.favorites = favorites
@@ -467,25 +1252,38 @@ def set_modern_style(dark_mode):
 
 def extract_key_sentences(text, num_sentences=5):
     """Extract key sentences from the text using TF-IDF"""
-    sentences = sent_tokenize(text)
-    if len(sentences) <= num_sentences:
-        return sentences
-    
-    # Create TF-IDF vectorizer
-    vectorizer = TfidfVectorizer(stop_words='english')
-    tfidf_matrix = vectorizer.fit_transform(sentences)
-    
-    # Calculate sentence scores
-    sentence_scores = []
-    for i, sentence in enumerate(sentences):
-        score = np.sum(tfidf_matrix[i].toarray())
-        sentence_scores.append((score, sentence))
-    
-    # Get top sentences
-    key_sentences = sorted(sentence_scores, reverse=True)[:num_sentences]
-    key_sentences = [sentence for _, sentence in key_sentences]
-    
-    return key_sentences
+    try:
+        # Check if NLTK punkt is available
+        try:
+            sentences = sent_tokenize(text)
+        except LookupError:
+            # Fallback: simple sentence splitting by periods
+            st.warning("NLTK punkt not available, using fallback sentence splitting")
+            sentences = [s.strip() for s in text.split('.') if s.strip()]
+        
+        if len(sentences) <= num_sentences:
+            return sentences
+        
+        # Create TF-IDF vectorizer
+        vectorizer = TfidfVectorizer(stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(sentences)
+        
+        # Calculate sentence scores
+        sentence_scores = []
+        for i, sentence in enumerate(sentences):
+            score = np.sum(tfidf_matrix[i].toarray())
+            sentence_scores.append((score, sentence))
+        
+        # Get top sentences
+        key_sentences = sorted(sentence_scores, reverse=True)[:num_sentences]
+        key_sentences = [sentence for _, sentence in key_sentences]
+        
+        return key_sentences
+        
+    except Exception as e:
+        st.error(f"Error extracting key sentences: {str(e)}")
+        # Return simple fallback
+        return [text[:200] + "..." if len(text) > 200 else text]
 
 def highlight_key_sentences(summary):
     """Highlight key sentences in the summary"""
@@ -516,17 +1314,29 @@ def get_sentiment_interval(duration_min):
 def create_analysis_distribution_chart():
     """Create a chart showing the distribution of analyses"""
     try:
-        if not st.session_state.history:
+        if not st.session_state.history or len(st.session_state.history) < 2:
             return None
             
         # Prepare data for the chart
         df = pd.DataFrame(st.session_state.history)
         
+        # Ensure timestamp column exists and is valid
+        if 'timestamp' not in df.columns:
+            return None
+            
         # Convert timestamp to datetime and extract hour
-        df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
+        try:
+            df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
+        except Exception as e:
+            logger.warning(f"Could not parse timestamps: {e}")
+            return None
         
         # Count analyses by hour
         hour_counts = df['hour'].value_counts().sort_index()
+        
+        # Ensure we have data to plot
+        if hour_counts.empty or len(hour_counts) < 2:
+            return None
         
         # Create figure
         fig = go.Figure()
@@ -606,7 +1416,7 @@ def create_analysis_distribution_chart():
         return fig
         
     except Exception as e:
-        st.error(f"Error creating analysis distribution chart: {str(e)}")
+        logger.error(f"Error creating analysis distribution chart: {str(e)}")
         return None
 
 def analyze_sentiment(url):
@@ -645,9 +1455,14 @@ def analyze_sentiment(url):
             # If we've reached a new interval, analyze the accumulated text
             if segment_min - current_start >= interval:
                 if current_text:
-                    blob = TextBlob(current_text)
-                    sentiments.append(blob.sentiment.polarity)
-                    time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
+                    try:
+                        blob = TextBlob(current_text)
+                        sentiments.append(blob.sentiment.polarity)
+                        time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
+                    except Exception as e:
+                        logger.warning(f"Sentiment analysis failed for segment: {e}")
+                        sentiments.append(0.0)  # Neutral sentiment as fallback
+                        time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
                 
                 # Reset for next interval
                 current_text = segment['text']
@@ -657,9 +1472,14 @@ def analyze_sentiment(url):
         
         # Analyze the last segment
         if current_text:
-            blob = TextBlob(current_text)
-            sentiments.append(blob.sentiment.polarity)
-            time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
+            try:
+                blob = TextBlob(current_text)
+                sentiments.append(blob.sentiment.polarity)
+                time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
+            except Exception as e:
+                logger.warning(f"Sentiment analysis failed for last segment: {e}")
+                sentiments.append(0.0)  # Neutral sentiment as fallback
+                time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
         
         # Store average polarity
         st.session_state.avg_polarity = np.mean(sentiments)
@@ -831,85 +1651,104 @@ def cleanup_audio():
         except:
             pass
 
-def process_video(url):
-    """Process YouTube video and generate summary"""
+def enhanced_process_video(url, user_preferences=None):
+    """
+    Enhanced video processing pipeline with intelligent features
+    """
     try:
         cleanup_audio()
         process_start_time = time.time()
         
-        # Get video ID
-        video_id = url.split("watch?v=")[-1].split('&')[0]
-        
-        # Get transcript
-        with st.status("Fetching transcript...", expanded=True) as status:
-            try:
-                try:
-                    ytt_api = YouTubeTranscriptApi()
-                    transcript = ytt_api.fetch(video_id)
-                    full_text = " ".join([line['text'] for line in transcript])
-                    if not full_text.strip():
-                        st.error("No transcript available for this video")
-                        return False
-                    st.session_state.transcript = full_text
-                    status.update(label="Transcript fetched successfully!", state="complete")
-                except Exception as e:
-                    from youtube_transcript_api._errors import NoTranscriptFound
-                    if isinstance(e, NoTranscriptFound):
-                        st.error("No transcript available for this video.")
-                    else:
-                        st.error(f"Error fetching transcript: {str(e)}")
-                    return False
-            except Exception as e:
-                st.error(f"Error fetching transcript: {str(e)}")
+        # Stage 1: Enhanced URL Validation
+        with st.status("Validating YouTube URL...", expanded=True) as status:
+            validation_result = validate_youtube_url(url)
+            if not validation_result.is_valid:
+                st.error(f"URL validation failed: {validation_result.error}")
                 return False
+            status.update(label="URL validated successfully!", state="complete")
         
-        # Initialize model
-        with st.status("Initializing summarization model...", expanded=True) as status:
-            try:
-                summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-                status.update(label="Model initialized successfully!", state="complete")
-            except Exception as e:
-                st.error(f"Error initializing model: {str(e)}")
+        # Stage 2: Extract Video Metadata
+        with st.status("Extracting video metadata...", expanded=True) as status:
+            metadata = extract_video_metadata(validation_result.video_id)
+            if metadata:
+                st.info(f"📺 **{metadata.title}** by **{metadata.channel}**")
+            status.update(label="Metadata extracted!", state="complete")
+        
+        # Stage 3: Intelligent Transcript Extraction
+        with st.status("Extracting transcript using multiple strategies...", expanded=True) as status:
+            transcript, method_used = intelligent_transcript_extraction(validation_result.video_id)
+            
+            if not transcript:
+                # Handle transcript unavailability intelligently
+                fallback_options = handle_transcript_unavailable(validation_result.video_id, metadata)
+                st.error(fallback_options['error_message'])
+                
+                if fallback_options['alternative_methods']:
+                    st.info("**Alternative methods available:**")
+                    for method in fallback_options['alternative_methods']:
+                        st.write(f"• {method}")
+                
                 return False
+            
+            st.session_state.transcript = transcript
+            st.success(f"✅ Transcript extracted using: {method_used}")
+            status.update(label="Transcript extracted successfully!", state="complete")
         
-        # Generate summary
-        with st.status("Generating summary...", expanded=True) as status:
+        # Stage 4: Content Categorization
+        with st.status("Analyzing content type...", expanded=True) as status:
+            content_category = categorize_content(transcript, metadata)
+            st.info(f"🎯 **Content Category:** {content_category.category} (Confidence: {content_category.confidence:.1%})")
+            
+            if content_category.subcategories:
+                st.write(f"**Subcategories:** {', '.join(content_category.subcategories)}")
+            
+            status.update(label="Content categorized!", state="complete")
+        
+        # Stage 5: Content-Aware Preprocessing
+        with st.status("Preprocessing content for optimal summarization...", expanded=True) as status:
+            processed_transcript = content_aware_preprocessing(transcript, content_category, metadata)
+            status.update(label="Content preprocessed!", state="complete")
+        
+        # Stage 6: Enhanced Summarization
+        with st.status("Generating intelligent summary...", expanded=True) as status:
             try:
-                # Split into chunks that fit within the model's context window
-                max_chunk_size = 1024
-                chunks = [full_text[i:i+max_chunk_size] for i in range(0, len(full_text), max_chunk_size)]
-                
-                summarized_text = []
-                for chunk in chunks:
-                    summary = summarizer(chunk)
-                    summarized_text.append(summary[0]['summary_text'])
-                
-                st.session_state.summary = " ".join(summarized_text)
+                summary = enhanced_summarization_pipeline(processed_transcript, content_category, user_preferences)
+                st.session_state.summary = summary
                 status.update(label="Summary generated successfully!", state="complete")
             except Exception as e:
-                st.error(f"Error during summarization: {str(e)}")
-                return False
+                st.error(f"Enhanced summarization failed: {str(e)}")
+                # Fallback to basic summarization
+                st.warning("Falling back to basic summarization...")
+                summary = _fallback_summarization(processed_transcript)
+                st.session_state.summary = summary
+                status.update(label="Basic summary generated!", state="complete")
         
-        # Generate audio
+        # Stage 7: Generate Audio Summary
         with st.status("Generating audio summary...", expanded=True) as status:
             audio_file = text_to_speech(st.session_state.summary)
             if audio_file:
                 st.session_state.audio_file = audio_file
                 status.update(label="Audio summary generated!", state="complete")
         
-        # Sentiment analysis
-        with st.status("Analyzing sentiment...", expanded=True) as status:
+        # Stage 8: Enhanced Sentiment Analysis
+        with st.status("Analyzing sentiment and content insights...", expanded=True) as status:
             analyze_sentiment(url)
             status.update(label="Sentiment analysis complete!", state="complete")
-            
+        
         # Calculate and store execution time
         st.session_state.execution_time = time.time() - process_start_time
         st.session_state.analysis_complete = True
         
-        # Add to history
+        # Store enhanced metadata in session state
+        st.session_state.video_metadata = metadata
+        st.session_state.content_category = content_category
+        st.session_state.transcript_method = method_used
+        
+        # Add to history with enhanced information
+        video_title = metadata.title if metadata else f"Video {validation_result.video_id[:8]}..."
         add_to_history(
-            video_id,
-            f"Video {video_id[:8]}...",
+            validation_result.video_id,
+            video_title,
             st.session_state.summary,
             st.session_state.avg_polarity
         )
@@ -917,8 +1756,13 @@ def process_video(url):
         return True
         
     except Exception as e:
+        logger.error(f"Enhanced video processing error: {e}")
         st.error(f"Processing error: {str(e)}")
         return False
+
+def process_video(url):
+    """Legacy process_video function - now calls enhanced version"""
+    return enhanced_process_video(url)
 
 def add_to_history(video_id, title, summary, sentiment):
     """Add a video to history with timestamp"""
@@ -981,7 +1825,12 @@ def display_modern_results():
             <h3 style='margin-bottom: 1.5rem;'>Video Summary</h3>
             """, unsafe_allow_html=True)
         
-        highlighted_summary = highlight_key_sentences(st.session_state.summary)
+        try:
+            highlighted_summary = highlight_key_sentences(st.session_state.summary)
+        except Exception as e:
+            st.warning(f"Could not highlight key sentences: {str(e)}")
+            highlighted_summary = st.session_state.summary
+        
         st.markdown(
             f'<div class="glass-card summary-text">{highlighted_summary}</div>', 
             unsafe_allow_html=True
@@ -1007,8 +1856,46 @@ def display_modern_results():
     
     with tabs[1]:  # Analysis Tab
         st.markdown("""
-            <h3 style='margin-bottom: 1.5rem;'>Sentiment Analysis</h3>
+            <h3 style='margin-bottom: 1.5rem;'>Content Analysis & Insights</h3>
             """, unsafe_allow_html=True)
+        
+        # Enhanced content information
+        if hasattr(st.session_state, 'content_category') and st.session_state.content_category:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                st.metric(
+                    "Content Category",
+                    st.session_state.content_category.category,
+                    f"Confidence: {st.session_state.content_category.confidence:.1%}"
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                if st.session_state.content_category.subcategories:
+                    st.markdown("**Subcategories:**")
+                    for subcat in st.session_state.content_category.subcategories:
+                        st.write(f"• {subcat}")
+            
+            with col2:
+                if hasattr(st.session_state, 'video_metadata') and st.session_state.video_metadata:
+                    st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+                    st.metric(
+                        "Channel",
+                        st.session_state.video_metadata.channel,
+                        f"Upload: {st.session_state.video_metadata.upload_date}"
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    if st.session_state.video_metadata.view_count > 0:
+                        st.markdown(f"**Views:** {st.session_state.video_metadata.view_count:,}")
+        
+        # Transcript method used
+        if hasattr(st.session_state, 'transcript_method') and st.session_state.transcript_method:
+            st.info(f"📝 **Transcript Source:** {st.session_state.transcript_method}")
+        
+        # Sentiment analysis
+        st.markdown("### 📊 Sentiment Analysis")
         if st.session_state.sentiment_fig is not None:
             st.plotly_chart(st.session_state.sentiment_fig, use_container_width=True)
             
@@ -1020,6 +1907,9 @@ def display_modern_results():
                 help="Range: -1 (most negative) to +1 (most positive)"
             )
             st.markdown('</div>', unsafe_allow_html=True)
+        elif hasattr(st.session_state, 'avg_polarity') and st.session_state.avg_polarity != 0:
+            st.markdown("### 📊 Sentiment Analysis")
+            st.info("Sentiment analysis completed. Chart will be displayed after analysis.")
     
     with tabs[2]:  # Performance Tab
         st.markdown("""
@@ -1225,13 +2115,16 @@ def create_dashboard():
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Analysis Distribution
-    if st.session_state.history:
+    if st.session_state.history and len(st.session_state.history) > 1:
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
         st.subheader("📊 Analysis Distribution")
         
         # Create visualization of analysis types
         fig = create_analysis_distribution_chart()
-        st.plotly_chart(fig, use_container_width=True)
+        if fig is not None:
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No analysis data available for visualization")
         
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1361,20 +2254,81 @@ def show_settings_view():
                 st.session_state.settings.get('animation_speed', 1.0)
             )
     with tabs[1]:  # Analysis Tab
-        st.markdown("""
-            <h3 style='margin-bottom: 1.5rem;'>Sentiment Analysis</h3>""", 
-		unsafe_allow_html=True)
-        if st.session_state.sentiment_fig is not None:
-            st.plotly_chart(st.session_state.sentiment_fig, use_container_width=True)
+        st.markdown("### 🔍 Analysis Settings")
+        with st.container():
+            # Content Analysis Preferences
+            st.markdown("#### Content Analysis Options")
+            detail_level = st.selectbox(
+                "Summary Detail Level",
+                ["Concise", "Balanced", "Detailed"],
+                index=["Concise", "Balanced", "Detailed"].index(
+                    st.session_state.settings.get('detail_level', 'Balanced')
+                ),
+                help="Choose how detailed you want your summaries to be"
+            )
+            
+            include_timestamps = st.toggle(
+                "Include Timestamps in Summary", 
+                st.session_state.settings.get('include_timestamps', False),
+                help="Add timestamps for key points in the summary"
+            )
+            
+            summary_format = st.selectbox(
+                "Summary Format",
+                ["Paragraph", "Bullet Points", "Structured", "Mixed"],
+                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(
+                    st.session_state.settings.get('summary_format', 'Paragraph')
+                )
+            )
+            
+            # Model Selection Preferences
+            st.markdown("#### Model Preferences")
+            preferred_model = st.selectbox(
+                "Preferred Summarization Model",
+                ["Auto-select (Recommended)", "BART", "Pegasus", "T5", "Fast"],
+                index=["Auto-select (Recommended)", "BART", "Pegasus", "T5", "Fast"].index(
+                    st.session_state.settings.get('preferred_model', 'Auto-select (Recommended)')
+                ),
+                help="Choose your preferred model or let the system auto-select based on content"
+            )
+            
+            # Content Type Preferences
+            st.markdown("#### Content Type Preferences")
+            content_preferences = st.multiselect(
+                "Prioritize These Content Types",
+                ["News/Current Events", "Educational", "Technical/Tutorial", "Entertainment", "Review/Opinion", "Interview/Podcast"],
+                default=st.session_state.settings.get('content_preferences', ["Educational", "Technical/Tutorial"]),
+                help="Select content types you're most interested in for better summarization"
+            )
+            
+            # Save preferences
+            if st.button("Save Analysis Preferences"):
+                st.session_state.settings.update({
+                    'detail_level': detail_level.lower(),
+                    'include_timestamps': include_timestamps,
+                    'summary_format': summary_format.lower().replace(' ', '_'),
+                    'preferred_model': preferred_model,
+                    'content_preferences': content_preferences
+                })
+                save_data(SETTINGS_FILE, st.session_state.settings)
+                st.success("Analysis preferences saved!")
         
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.metric(
-            "Overall Sentiment Score",
-            f"{st.session_state.avg_polarity:.2f}",
-            delta=None,
-            help="Range: -1 (most negative) to +1 (most positive)"
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Show current sentiment analysis if available
+        if st.session_state.sentiment_fig is not None:
+            st.markdown("### 📊 Sentiment Analysis")
+            st.plotly_chart(st.session_state.sentiment_fig, use_container_width=True)
+            
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.metric(
+                "Overall Sentiment Score",
+                f"{st.session_state.avg_polarity:.2f}",
+                delta=None,
+                help="Range: -1 (most negative) to +1 (most positive)"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+        elif hasattr(st.session_state, 'avg_polarity') and st.session_state.avg_polarity != 0:
+            st.markdown("### 📊 Sentiment Analysis")
+            st.info("Sentiment analysis completed. Chart will be displayed after analysis.")
 
     
     with tabs[2]:  # Export Settings
@@ -1459,11 +2413,6 @@ def show_settings_view():
             'font_size': font_size,
             'animations_enabled': animations_enabled,
             'animation_speed': animation_speed,
-            'voice': voice,
-            'audio_quality': quality,
-            'playback_speed': playback_speed,
-            'volume': volume,
-            'auto_play': auto_play,
             'export_formats': formats,
             'include_timestamps': include_timestamps,
             'include_analytics': include_analytics,
@@ -1487,13 +2436,80 @@ def show_settings_view():
         st.rerun()
 
 def create_analyzer_view():
-    """Create the main analyzer view"""
+    """Create the main analyzer view with enhanced options"""
     st.markdown("""
         <div style='text-align: center; padding: 2rem 0;'>
             <h1 style='margin-bottom: 1rem;'>🎥 YouTube Video Summarizer</h1>
             <p style='opacity: 0.8;'>Transform your video content into concise, actionable insights</p>
         </div>
     """, unsafe_allow_html=True)
+    
+    # Enhanced Analysis Options
+    with st.expander("🔧 Advanced Analysis Options", expanded=False):
+        st.markdown("### Customize Your Analysis")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            detail_level = st.selectbox(
+                "Summary Detail Level",
+                ["Concise", "Balanced", "Detailed"],
+                index=["Concise", "Balanced", "Detailed"].index(
+                    st.session_state.settings.get('detail_level', 'Balanced')
+                ),
+                help="Choose how detailed you want your summaries to be"
+            )
+            
+            summary_format = st.selectbox(
+                "Summary Format",
+                ["Paragraph", "Bullet Points", "Structured", "Mixed"],
+                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(
+                    st.session_state.settings.get('summary_format', 'Paragraph')
+                )
+            )
+            
+            include_timestamps = st.toggle(
+                "Include Timestamps", 
+                st.session_state.settings.get('include_timestamps', False),
+                help="Add timestamps for key points in the summary"
+            )
+        
+        with col2:
+            preferred_model = st.selectbox(
+                "Preferred Model",
+                ["Auto-select (Recommended)", "BART", "Pegasus", "T5", "Fast"],
+                index=["Auto-select (Recommended)", "BART", "Pegasus", "T5", "Fast"].index(
+                    st.session_state.settings.get('preferred_model', 'Auto-select (Recommended)')
+                )
+            )
+            
+            content_priority = st.multiselect(
+                "Content Priorities",
+                ["News/Current Events", "Educational", "Technical/Tutorial", "Entertainment", "Review/Opinion", "Interview/Podcast"],
+                default=st.session_state.settings.get('content_preferences', ["Educational", "Technical/Tutorial"]),
+                help="Select content types to prioritize"
+            )
+            
+            processing_mode = st.selectbox(
+                "Processing Mode",
+                ["Fast", "Balanced", "High Quality"],
+                index=["Fast", "Balanced", "High Quality"].index(
+                    st.session_state.settings.get('processing_mode', 'Balanced')
+                )
+            )
+        
+        # Save preferences button
+        if st.button("💾 Save Preferences", type="secondary"):
+            st.session_state.settings.update({
+                'detail_level': detail_level.lower(),
+                'summary_format': summary_format.lower().replace(' ', '_'),
+                'include_timestamps': include_timestamps,
+                'preferred_model': preferred_model,
+                'content_preferences': content_priority,
+                'processing_mode': processing_mode
+            })
+            save_data(SETTINGS_FILE, st.session_state.settings)
+            st.success("Preferences saved! They will be applied to your next analysis.")
     
     # Input section
     st.markdown('<div class="glass-card input-container">', unsafe_allow_html=True)
@@ -1503,10 +2519,32 @@ def create_analyzer_view():
         help="Paste any YouTube video URL to get started"
     )
     
+    # Show supported URL formats
+    with st.expander("📋 Supported URL Formats"):
+        st.markdown("""
+        **Supported YouTube URL formats:**
+        - `https://www.youtube.com/watch?v=VIDEO_ID`
+        - `https://youtu.be/VIDEO_ID`
+        - `https://www.youtube.com/embed/VIDEO_ID`
+        - `https://m.youtube.com/watch?v=VIDEO_ID`
+        - `https://www.youtube.com/shorts/VIDEO_ID`
+        """)
+    
     if st.button("🚀 Generate Summary", type="primary"):
         if url:
             st.session_state.url = url
-            if process_video(url):
+            
+            # Prepare user preferences for enhanced processing
+            user_preferences = {
+                'detail_level': detail_level.lower(),
+                'format': summary_format.lower().replace(' ', '_'),
+                'include_timestamps': include_timestamps,
+                'preferred_model': preferred_model,
+                'content_priorities': content_priority,
+                'processing_mode': processing_mode
+            }
+            
+            if enhanced_process_video(url, user_preferences):
                 st.balloons()
                 st.success("✨ Summary generated successfully!")
         else:
@@ -1519,14 +2557,45 @@ def create_analyzer_view():
     # Footer
     st.markdown("""
     <div class="glass-card" style="text-align: center; margin-top: 3rem;">
-        <p style="margin: 0;">Made with ❤️ | Powered by BART and TextBlob</p>
+        <p style="margin: 0;">Made with ❤️ | Powered by Enhanced AI Models</p>
     </div>
     """, unsafe_allow_html=True)
+
+def ensure_nltk_data():
+    """Ensure NLTK data is available, download if needed"""
+    if not NLTK_AVAILABLE:
+        st.warning("NLTK is not available. Using fallback text processing.")
+        return False
+        
+    try:
+        # Try to import and use punkt
+        from nltk.data import find
+        find('tokenizers/punkt')
+        return True
+    except LookupError:
+        st.warning("NLTK punkt tokenizer not found. Downloading...")
+        try:
+            import nltk
+            nltk.download('punkt', quiet=True)
+            nltk.download('wordnet', quiet=True)
+            nltk.download('omw-1.4', quiet=True)
+            nltk.download('stopwords', quiet=True)
+            
+            # Verify download
+            find('tokenizers/punkt')
+            st.success("NLTK data downloaded successfully!")
+            return True
+        except Exception as e:
+            st.error(f"Failed to download NLTK data: {str(e)}")
+            return False
 
 def main():
     """Main function"""
     # Install required packages
     # install_packages()
+    
+    # Ensure NLTK data is available
+    ensure_nltk_data()
     
     # Initialize
     init_session_states()

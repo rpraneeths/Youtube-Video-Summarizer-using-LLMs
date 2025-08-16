@@ -12,3 +12,5 @@ textblob
 nltk
 scikit-learn
 numpy
+urllib3
+typing-extensions
