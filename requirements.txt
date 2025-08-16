@@ -1,0 +1,14 @@
+streamlit
+pandas
+plotly
+youtube-transcript-api
+transformers
+torch
+gtts
+pygame
+requests
+Pillow
+textblob
+nltk
+scikit-learn
+numpy
