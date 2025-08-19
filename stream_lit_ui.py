@@ -112,36 +112,44 @@ def remove_redundant_sentences(text: str) -> str:
     return " ".join(cleaned)
 
 def clean_summary_text(text: str) -> str:
-    """Remove duplicate or highly similar sentences and repeated phrases."""
+    """Remove duplicate or highly similar sentences and repeated phrases with enhanced deduplication."""
     import re
     from difflib import SequenceMatcher
     
-    # First, remove repeated phrases within the same sentence
-    text = re.sub(r'\b(\w+\s+){1,4}\1', r'\1', text)
+    if not text or len(text.strip()) < 10:
+        return text
     
-    # Split into sentences
-    sentences = re.split(r'(?<=[.!?]) +', text)
+    # First, remove repeated phrases within the same sentence (more aggressive)
+    text = re.sub(r'\b(\w+\s+){1,6}\1', r'\1', text)
+    
+    # Split into sentences using more robust pattern
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     cleaned = []
     seen_sentences = set()
     
     for s in sentences:
         s_clean = s.strip()
-        if len(s_clean) < 4:
+        # Filter out extremely short or insignificant sentences
+        if len(s_clean) < 8:
             continue
             
-        # Normalize sentence for comparison (lowercase, remove extra spaces)
+        # Normalize sentence for comparison (lowercase, remove extra spaces, punctuation)
         s_normalized = re.sub(r'\s+', ' ', s_clean.lower()).strip()
+        s_normalized = re.sub(r'[^\w\s]', '', s_normalized)  # Remove punctuation for comparison
         
         # Skip if exact duplicate (case-insensitive)
         if s_normalized in seen_sentences:
             continue
             
-        # Skip if too similar to any previous sentence (more aggressive similarity check)
+        # Skip if too similar to any previous sentence (very aggressive similarity check)
         is_similar = False
         for prev_sentence in cleaned:
             prev_normalized = re.sub(r'\s+', ' ', prev_sentence.lower()).strip()
+            prev_normalized = re.sub(r'[^\w\s]', '', prev_normalized)
+            
+            # Use very aggressive threshold for similarity (0.7 as requested)
             ratio = SequenceMatcher(None, prev_normalized, s_normalized).ratio()
-            if ratio > 0.7:  # Lowered threshold for more aggressive filtering
+            if ratio > 0.7:
                 is_similar = True
                 break
                 
@@ -152,14 +160,33 @@ def clean_summary_text(text: str) -> str:
     # Join sentences and do final cleanup
     result = " ".join(cleaned)
     
-    # Remove any remaining repeated phrases across sentence boundaries
-    result = re.sub(r'\b(\w+\s+){2,6}\1', r'\1', result)
+    # Remove any remaining repeated phrases across sentence boundaries (more aggressive)
+    result = re.sub(r'\b(\w+\s+){2,8}\1', r'\1', result)
     
-    return result
+    # Remove repeated phrases that appear more than once in the entire summary
+    words = result.split()
+    for i in range(len(words) - 3):
+        for j in range(4, min(10, len(words) - i)):
+            phrase = ' '.join(words[i:i+j])
+            if result.count(phrase) > 1:
+                # Keep only the first occurrence
+                result = result.replace(phrase, '', result.count(phrase) - 1)
+    
+    # Final cleanup: remove excessive whitespace and normalize punctuation
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r'\.{2,}', '.', result)
+    result = re.sub(r'!{2,}', '!', result)
+    result = re.sub(r'\?{2,}', '?', result)
+    
+    return result.strip()
 
 def remove_repeated_lines(text: str) -> str:
-    """Remove repeated line patterns that commonly occur in summaries."""
+    """Remove repeated line patterns that commonly occur in summaries with enhanced similarity checking."""
     import re
+    from difflib import SequenceMatcher
+    
+    if not text:
+        return text
     
     # Split into lines
     lines = text.split('\n')
@@ -173,15 +200,19 @@ def remove_repeated_lines(text: str) -> str:
             
         # Normalize line for comparison
         line_normalized = re.sub(r'\s+', ' ', line_clean.lower()).strip()
+        line_normalized = re.sub(r'[^\w\s]', '', line_normalized)  # Remove punctuation
         
         # Skip if exact duplicate
         if line_normalized in seen_lines:
             continue
             
-        # Skip if too similar to previous lines
+        # Skip if too similar to previous lines (check last 3 lines as requested)
         is_similar = False
-        for prev_line in cleaned_lines[-3:]:  # Check last 3 lines
+        for prev_line in cleaned_lines[-3:]:  # Check last 3 lines as requested
             prev_normalized = re.sub(r'\s+', ' ', prev_line.lower()).strip()
+            prev_normalized = re.sub(r'[^\w\s]', '', prev_normalized)
+            
+            # Use similarity threshold of 0.8 for lines as requested
             ratio = SequenceMatcher(None, prev_normalized, line_normalized).ratio()
             if ratio > 0.8:
                 is_similar = True
@@ -754,7 +785,7 @@ def generate_contextual_prompt(transcript: str, content_category: ContentCategor
 
 def enhanced_summarization_pipeline(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
     """
-    Multi-stage summarization with intelligent model selection
+    Multi-stage summarization with intelligent model selection and enhanced deduplication
     """
     try:
         if not transcript:
@@ -813,14 +844,23 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                 logger.info(f"Combined summary length: {len(combined_summary)}")
                 logger.info(f"Number of chunks processed: {len(chunks)}")
                 
-                # Stage 5.5: Clean summary text (remove duplicates, near-duplicates, and repeated phrases)
+                # Stage 5.5: Enhanced cleanup - apply both functions in sequence for comprehensive deduplication
                 with st.status("Cleaning summary text...", expanded=True) as status:
+                    # First pass: clean summary text (remove duplicates, near-duplicates, and repeated phrases)
                     cleaned_summary = clean_summary_text(combined_summary)
-                    logger.info(f"Cleaned summary length: {len(cleaned_summary)}")
+                    logger.info(f"After sentence deduplication length: {len(cleaned_summary)}")
                     
-                    # Additional step: remove repeated lines
+                    # Second pass: remove repeated lines with enhanced similarity checking
                     cleaned_summary = remove_repeated_lines(cleaned_summary)
                     logger.info(f"After line deduplication length: {len(cleaned_summary)}")
+                    
+                    # Third pass: additional cleanup for any remaining repetition
+                    cleaned_summary = clean_summary_text(cleaned_summary)
+                    logger.info(f"Final cleaned summary length: {len(cleaned_summary)}")
+                    
+                    # Fourth pass: final line cleanup to catch any remaining repetition
+                    cleaned_summary = remove_repeated_lines(cleaned_summary)
+                    logger.info(f"After final line cleanup length: {len(cleaned_summary)}")
                     
                     status.update(label="Summary text cleaned!", state="complete")
                 
@@ -904,10 +944,13 @@ def _fallback_summarization(text: str) -> str:
         top_indices = sentence_scores.argsort()[-3:][::-1]
         top_sentences = [sentences[i] for i in sorted(top_indices)]
         
-        # Clean fallback summary text
+        # Clean fallback summary text using enhanced deduplication
         fallback_summary = " ".join(top_sentences)
         cleaned_fallback = clean_summary_text(fallback_summary)
-        return remove_repeated_lines(cleaned_fallback)
+        cleaned_fallback = remove_repeated_lines(cleaned_fallback)
+        # Final pass to catch any remaining repetition
+        cleaned_fallback = clean_summary_text(cleaned_fallback)
+        return cleaned_fallback
         
     except Exception as e:
         logger.error(f"Fallback summarization error: {e}")
@@ -1446,8 +1489,19 @@ def extract_key_sentences(text, num_sentences=5):
     try:
         # Check if NLTK punkt is available
         try:
-            sentences = sent_tokenize(text)
-        except LookupError:
+            # Try to download NLTK data if not available
+            try:
+                sentences = sent_tokenize(text)
+            except LookupError:
+                import nltk
+                try:
+                    nltk.download('punkt', quiet=True)
+                    sentences = sent_tokenize(text)
+                except Exception:
+                    # Fallback: simple sentence splitting by periods
+                    st.warning("NLTK punkt not available, using fallback sentence splitting")
+                    sentences = [s.strip() for s in text.split('.') if s.strip()]
+        except Exception:
             # Fallback: simple sentence splitting by periods
             st.warning("NLTK punkt not available, using fallback sentence splitting")
             sentences = [s.strip() for s in text.split('.') if s.strip()]
@@ -1626,7 +1680,17 @@ def analyze_sentiment(url):
                 return
         
         # Calculate video duration in minutes
-        duration_sec = transcript[-1]['start'] + transcript[-1]['duration']
+        # Handle both dictionary and object access for transcript segments
+        try:
+            if hasattr(transcript[-1], 'start'):
+                # FetchedTranscriptSnippet object
+                duration_sec = transcript[-1].start + transcript[-1].duration
+            else:
+                # Dictionary format
+                duration_sec = transcript[-1]['start'] + transcript[-1]['duration']
+        except (AttributeError, KeyError, IndexError):
+            # Fallback: estimate duration from transcript length
+            duration_sec = len(transcript) * 10  # Assume 10 seconds per segment
         duration_min = duration_sec / 60
         
         # Determine appropriate interval
@@ -1639,7 +1703,19 @@ def analyze_sentiment(url):
         current_start = 0
         
         for segment in transcript:
-            segment_min = segment['start'] / 60
+            # Handle both dictionary and object access for transcript segments
+            try:
+                if hasattr(segment, 'start'):
+                    # FetchedTranscriptSnippet object
+                    segment_min = segment.start / 60
+                    segment_text = segment.text
+                else:
+                    # Dictionary format
+                    segment_min = segment['start'] / 60
+                    segment_text = segment['text']
+            except (AttributeError, KeyError):
+                # Skip malformed segments
+                continue
             
             # If we've reached a new interval, analyze the accumulated text
             if segment_min - current_start >= interval:
@@ -1654,10 +1730,10 @@ def analyze_sentiment(url):
                         time_labels.append(f"{int(current_start)}-{int(current_start)+interval}min")
                 
                 # Reset for next interval
-                current_text = segment['text']
+                current_text = segment_text
                 current_start = interval * (segment_min // interval)
             else:
-                current_text += " " + segment['text']
+                current_text += " " + segment_text
         
         # Analyze the last segment
         if current_text:
