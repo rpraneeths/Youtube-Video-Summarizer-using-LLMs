@@ -21,6 +21,9 @@ from PIL import Image
 from io import BytesIO
 from textblob import TextBlob
 
+# Import FLAN-T5 for prompt refinement
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
 # Import NLTK components with fallback
 try:
     import nltk
@@ -41,6 +44,154 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Load FLAN-T5 model for prompt refinement
+refiner_model_name = "google/flan-t5-base"  # or flan-t5-small for low memory
+try:
+    refiner_tokenizer = AutoTokenizer.from_pretrained(refiner_model_name)
+    refiner_model = AutoModelForSeq2SeqLM.from_pretrained(refiner_model_name)
+    FLAN_T5_AVAILABLE = True
+    logger.info("FLAN-T5 model loaded successfully for prompt refinement")
+except Exception as e:
+    logger.warning(f"Failed to load FLAN-T5 model: {e}")
+    refiner_tokenizer = None
+    refiner_model = None
+    FLAN_T5_AVAILABLE = False
+
+def refine_prompt(base_prompt: str) -> str:
+    """Refine a base prompt using FLAN-T5 model."""
+    # Check if FLAN-T5 is available
+    if not FLAN_T5_AVAILABLE or refiner_tokenizer is None or refiner_model is None:
+        logger.warning("FLAN-T5 model not available, skipping prompt refinement")
+        return base_prompt
+    
+    try:
+        # Check if the prompt is too long and truncate if necessary
+        if len(base_prompt) > 400:  # Leave room for the instruction
+            base_prompt = base_prompt[:400] + "..."
+        
+        input_text = f"Improve this instruction for better clarity and detail:\n\n{base_prompt}"
+        inputs = refiner_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
+        
+        # Generate refined prompt
+        with torch.no_grad():  # Disable gradient computation for inference
+            outputs = refiner_model.generate(
+                **inputs, 
+                max_length=128, 
+                min_length=20,
+                do_sample=False,
+                num_beams=4,
+                early_stopping=True
+            )
+        
+        refined_prompt = refiner_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        
+        # Validate the refined prompt
+        if not refined_prompt or len(refined_prompt.strip()) < 10:
+            logger.warning("Refined prompt too short, using original")
+            return base_prompt
+            
+        logger.info(f"Prompt refined successfully. Original length: {len(base_prompt)}, Refined length: {len(refined_prompt)}")
+        return refined_prompt
+        
+    except Exception as e:
+        logger.warning(f"Prompt refinement failed: {e}")
+        return base_prompt  # Return original prompt if refinement fails
+
+def remove_redundant_sentences(text: str) -> str:
+    """Remove duplicate sentences from summary."""
+    import re
+    seen = set()
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    cleaned = []
+    for s in sentences:
+        s_clean = s.strip()
+        if s_clean.lower() not in seen and len(s_clean) > 3:
+            cleaned.append(s_clean)
+            seen.add(s_clean.lower())
+    return " ".join(cleaned)
+
+def clean_summary_text(text: str) -> str:
+    """Remove duplicate or highly similar sentences and repeated phrases."""
+    import re
+    from difflib import SequenceMatcher
+    
+    # First, remove repeated phrases within the same sentence
+    text = re.sub(r'\b(\w+\s+){1,4}\1', r'\1', text)
+    
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    cleaned = []
+    seen_sentences = set()
+    
+    for s in sentences:
+        s_clean = s.strip()
+        if len(s_clean) < 4:
+            continue
+            
+        # Normalize sentence for comparison (lowercase, remove extra spaces)
+        s_normalized = re.sub(r'\s+', ' ', s_clean.lower()).strip()
+        
+        # Skip if exact duplicate (case-insensitive)
+        if s_normalized in seen_sentences:
+            continue
+            
+        # Skip if too similar to any previous sentence (more aggressive similarity check)
+        is_similar = False
+        for prev_sentence in cleaned:
+            prev_normalized = re.sub(r'\s+', ' ', prev_sentence.lower()).strip()
+            ratio = SequenceMatcher(None, prev_normalized, s_normalized).ratio()
+            if ratio > 0.7:  # Lowered threshold for more aggressive filtering
+                is_similar = True
+                break
+                
+        if not is_similar:
+            cleaned.append(s_clean)
+            seen_sentences.add(s_normalized)
+    
+    # Join sentences and do final cleanup
+    result = " ".join(cleaned)
+    
+    # Remove any remaining repeated phrases across sentence boundaries
+    result = re.sub(r'\b(\w+\s+){2,6}\1', r'\1', result)
+    
+    return result
+
+def remove_repeated_lines(text: str) -> str:
+    """Remove repeated line patterns that commonly occur in summaries."""
+    import re
+    
+    # Split into lines
+    lines = text.split('\n')
+    cleaned_lines = []
+    seen_lines = set()
+    
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+            
+        # Normalize line for comparison
+        line_normalized = re.sub(r'\s+', ' ', line_clean.lower()).strip()
+        
+        # Skip if exact duplicate
+        if line_normalized in seen_lines:
+            continue
+            
+        # Skip if too similar to previous lines
+        is_similar = False
+        for prev_line in cleaned_lines[-3:]:  # Check last 3 lines
+            prev_normalized = re.sub(r'\s+', ' ', prev_line.lower()).strip()
+            ratio = SequenceMatcher(None, prev_normalized, line_normalized).ratio()
+            if ratio > 0.8:
+                is_similar = True
+                break
+                
+        if not is_similar:
+            cleaned_lines.append(line_clean)
+            seen_lines.add(line_normalized)
+    
+    return '\n'.join(cleaned_lines)
 
 # Enhanced data structures
 class ValidationResult(NamedTuple):
@@ -615,6 +766,19 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
         # Stage 2: Generate contextual prompt
         llm_prompt = generate_contextual_prompt(processed_transcript, content_category, user_preferences)
         
+        # Stage 2.5: Refine prompt using FLAN-T5
+        if FLAN_T5_AVAILABLE:
+            with st.status("Refining prompt using FLAN-T5...", expanded=True) as status:
+                refined_prompt = refine_prompt(llm_prompt)
+                # Track if prompt refinement was used
+                st.session_state.prompt_refinement_used = refined_prompt != llm_prompt
+                status.update(label="Prompt refined successfully!", state="complete")
+        else:
+            # Skip refinement if FLAN-T5 is not available
+            refined_prompt = llm_prompt
+            st.session_state.prompt_refinement_used = False
+            st.info("🤖 FLAN-T5 not available - using standard prompt optimization")
+        
         # Stage 3: Model Selection based on content type
         model_name = _select_optimal_model(content_category)
         
@@ -625,21 +789,43 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                 
                 # Split into chunks that fit within the model's context window
                 max_chunk_size = _get_model_context_window(model_name)
-                chunks = [processed_transcript[i:i+max_chunk_size] for i in range(0, len(processed_transcript), max_chunk_size)]
+                # Use non-overlapping chunks to prevent repetition
+                chunks = []
+                for i in range(0, len(processed_transcript), max_chunk_size):
+                    chunk = processed_transcript[i:i+max_chunk_size]
+                    if chunk.strip():  # Only add non-empty chunks
+                        chunks.append(chunk)
                 
                 summarized_text = []
                 for i, chunk in enumerate(chunks):
                     if len(chunks) > 1:
                         status.update(label=f"Processing chunk {i+1}/{len(chunks)}...")
                     
-                    summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)
+                    # Use refined prompt with chunk content
+                    summary_input = f"{refined_prompt}\n\nContent:\n{chunk}"
+                    summary = summarizer(summary_input, max_length=150, min_length=50, do_sample=False)
                     summarized_text.append(summary[0]['summary_text'])
                 
                 # Stage 5: Combine and refine summaries
                 combined_summary = " ".join(summarized_text)
                 
+                # Log for debugging
+                logger.info(f"Combined summary length: {len(combined_summary)}")
+                logger.info(f"Number of chunks processed: {len(chunks)}")
+                
+                # Stage 5.5: Clean summary text (remove duplicates, near-duplicates, and repeated phrases)
+                with st.status("Cleaning summary text...", expanded=True) as status:
+                    cleaned_summary = clean_summary_text(combined_summary)
+                    logger.info(f"Cleaned summary length: {len(cleaned_summary)}")
+                    
+                    # Additional step: remove repeated lines
+                    cleaned_summary = remove_repeated_lines(cleaned_summary)
+                    logger.info(f"After line deduplication length: {len(cleaned_summary)}")
+                    
+                    status.update(label="Summary text cleaned!", state="complete")
+                
                 # Stage 6: Post-processing and formatting
-                final_summary = _format_summary_by_category(combined_summary, content_category)
+                final_summary = _format_summary_by_category(cleaned_summary, content_category)
                 
                 status.update(label="Summary generated successfully!", state="complete")
                 return final_summary
@@ -718,7 +904,10 @@ def _fallback_summarization(text: str) -> str:
         top_indices = sentence_scores.argsort()[-3:][::-1]
         top_sentences = [sentences[i] for i in sorted(top_indices)]
         
-        return " ".join(top_sentences)
+        # Clean fallback summary text
+        fallback_summary = " ".join(top_sentences)
+        cleaned_fallback = clean_summary_text(fallback_summary)
+        return remove_repeated_lines(cleaned_fallback)
         
     except Exception as e:
         logger.error(f"Fallback summarization error: {e}")
@@ -917,6 +1106,8 @@ def init_session_states():
         st.session_state.current_view = "analyzer"
     if 'url' not in st.session_state:
         st.session_state.url = ""
+    if 'prompt_refinement_used' not in st.session_state:
+        st.session_state.prompt_refinement_used = False
 
 def set_modern_style(dark_mode):
     """Set modern glassmorphism style for the app"""
@@ -1379,22 +1570,20 @@ def create_analysis_distribution_chart():
                 'font': {'size': 24, 'color': '#ffffff'}
             },
             xaxis=dict(
-                title="Hour of Day",
+                title=dict(text="Hour of Day", font=dict(color='#ffffff')),
                 tickmode='linear',
                 tick0=0,
                 dtick=1,
                 range=[-0.5, 23.5],
                 showgrid=True,
                 gridcolor='rgba(255,255,255,0.1)',
-                tickfont=dict(color='#ffffff'),
-                titlefont=dict(color='#ffffff')
+                tickfont=dict(color='#ffffff')
             ),
             yaxis=dict(
-                title="Number of Analyses",
+                title=dict(text="Number of Analyses", font=dict(color='#ffffff')),
                 showgrid=True,
                 gridcolor='rgba(255,255,255,0.1)',
-                tickfont=dict(color='#ffffff'),
-                titlefont=dict(color='#ffffff')
+                tickfont=dict(color='#ffffff')
             ),
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
@@ -1894,6 +2083,10 @@ def display_modern_results():
         if hasattr(st.session_state, 'transcript_method') and st.session_state.transcript_method:
             st.info(f"📝 **Transcript Source:** {st.session_state.transcript_method}")
         
+        # Prompt refinement indicator
+        if st.session_state.prompt_refinement_used:
+            st.success("🤖 **AI Prompt Refinement:** FLAN-T5 was used to enhance the summarization prompt for better results")
+        
         # Sentiment analysis
         st.markdown("### 📊 Sentiment Analysis")
         if st.session_state.sentiment_fig is not None:
@@ -2273,12 +2466,22 @@ def show_settings_view():
                 help="Add timestamps for key points in the summary"
             )
             
+            # Get the stored summary format and convert to title case for matching
+            stored_summary_format_1 = st.session_state.settings.get('summary_format', 'Paragraph')
+            # Convert from snake_case to title case to match the options list
+            if stored_summary_format_1 == 'paragraph':
+                stored_summary_format_1 = 'Paragraph'
+            elif stored_summary_format_1 == 'bullet_points':
+                stored_summary_format_1 = 'Bullet Points'
+            elif stored_summary_format_1 == 'structured':
+                stored_summary_format_1 = 'Structured'
+            elif stored_summary_format_1 == 'mixed':
+                stored_summary_format_1 = 'Mixed'
+            
             summary_format = st.selectbox(
                 "Summary Format",
                 ["Paragraph", "Bullet Points", "Structured", "Mixed"],
-                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(
-                    st.session_state.settings.get('summary_format', 'Paragraph')
-                )
+                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(stored_summary_format_1)
             )
             
             # Model Selection Preferences
@@ -2440,7 +2643,7 @@ def create_analyzer_view():
     st.markdown("""
         <div style='text-align: center; padding: 2rem 0;'>
             <h1 style='margin-bottom: 1rem;'>🎥 YouTube Video Summarizer</h1>
-            <p style='opacity: 0.8;'>Transform your video content into concise, actionable insights</p>
+            <p style='opacity: 0.8;'>Transform your video content into concise, actionable insights with AI-powered FLAN-T5 prompt refinement</p>
         </div>
     """, unsafe_allow_html=True)
     
@@ -2448,24 +2651,45 @@ def create_analyzer_view():
     with st.expander("🔧 Advanced Analysis Options", expanded=False):
         st.markdown("### Customize Your Analysis")
         
+        # FLAN-T5 integration info
+        st.info("🤖 **AI Enhancement:** This app uses FLAN-T5 to automatically refine and improve summarization prompts for better results. This happens automatically during processing.")
+        
         col1, col2 = st.columns(2)
         
         with col1:
+            # Get the stored detail level and convert to title case for matching
+            stored_detail_level = st.session_state.settings.get('detail_level', 'Balanced')
+            # Convert to title case to match the options list
+            if stored_detail_level == 'detailed':
+                stored_detail_level = 'Detailed'
+            elif stored_detail_level == 'concise':
+                stored_detail_level = 'Concise'
+            elif stored_detail_level == 'balanced':
+                stored_detail_level = 'Balanced'
+            
             detail_level = st.selectbox(
                 "Summary Detail Level",
                 ["Concise", "Balanced", "Detailed"],
-                index=["Concise", "Balanced", "Detailed"].index(
-                    st.session_state.settings.get('detail_level', 'Balanced')
-                ),
+                index=["Concise", "Balanced", "Detailed"].index(stored_detail_level),
                 help="Choose how detailed you want your summaries to be"
             )
+            
+            # Get the stored summary format and convert to title case for matching
+            stored_summary_format_2 = st.session_state.settings.get('summary_format', 'Paragraph')
+            # Convert from snake_case to title case to match the options list
+            if stored_summary_format_2 == 'paragraph':
+                stored_summary_format_2 = 'Paragraph'
+            elif stored_summary_format_2 == 'bullet_points':
+                stored_summary_format_2 = 'Bullet Points'
+            elif stored_summary_format_2 == 'structured':
+                stored_summary_format_2 = 'Structured'
+            elif stored_summary_format_2 == 'mixed':
+                stored_summary_format_2 = 'Mixed'
             
             summary_format = st.selectbox(
                 "Summary Format",
                 ["Paragraph", "Bullet Points", "Structured", "Mixed"],
-                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(
-                    st.session_state.settings.get('summary_format', 'Paragraph')
-                )
+                index=["Paragraph", "Bullet Points", "Structured", "Mixed"].index(stored_summary_format_2)
             )
             
             include_timestamps = st.toggle(
@@ -2648,6 +2872,7 @@ def main():
         <h3 style='margin-bottom: 1rem;'>📱 Features</h3>
         <ul style='list-style-type: none; padding: 0;'>
             <li>📝 AI-powered summaries</li>
+            <li>🤖 FLAN-T5 prompt refinement</li>
             <li>📊 Sentiment analysis</li>
             <li>🎧 Audio playback</li>
             <li>📈 Performance metrics</li>
