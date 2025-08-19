@@ -1,4 +1,4 @@
-# 🎬 Enhanced YouTube Video Summarizer
+# Video Transcript Summarization using LLM's
 
 A powerful, AI-driven YouTube video summarization application built with Streamlit that provides intelligent content analysis, multi-model summarization, and advanced user customization.
 
