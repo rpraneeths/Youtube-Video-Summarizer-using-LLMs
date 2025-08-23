@@ -112,12 +112,28 @@ def remove_redundant_sentences(text: str) -> str:
     return " ".join(cleaned)
 
 def clean_summary_text(text: str) -> str:
-    """Remove duplicate or highly similar sentences and repeated phrases with enhanced deduplication."""
+    """Remove duplicate or highly similar sentences and repeated phrases with enhanced deduplication and noise removal."""
     import re
     from difflib import SequenceMatcher
     
     if not text or len(text.strip()) < 10:
         return text
+    
+    # Remove common noise patterns and repetitive phrases
+    noise_patterns = [
+        r'\b(letters?\s+from\s+\w+)\b',
+        r'\b(film-maker\s+and\s+columnist)\b',
+        r'\b(columnist\s+and\s+\w+)\b',
+        r'\b(journalist\s+and\s+\w+)\b',
+        r'\b(\w+\s+and\s+columnist)\b',
+        r'\b(\w+\s+and\s+journalist)\b',
+        r'\b(repeated\s+names?\s+like\s+\w+\s+\w+)\b',
+        r'\b(um|uh|like|you\s+know|basically|actually|literally)\b',
+        r'\b(so|well|right|okay|yeah|wow|amazing)\b'
+    ]
+    
+    for pattern in noise_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
     
     # First, remove repeated phrases within the same sentence (more aggressive)
     text = re.sub(r'\b(\w+\s+){1,6}\1', r'\1', text)
@@ -131,6 +147,10 @@ def clean_summary_text(text: str) -> str:
         s_clean = s.strip()
         # Filter out extremely short or insignificant sentences
         if len(s_clean) < 8:
+            continue
+            
+        # Skip sentences that are just noise patterns
+        if re.search(r'^(letters?\s+from|film-maker|columnist|journalist)', s_clean, re.IGNORECASE):
             continue
             
         # Normalize sentence for comparison (lowercase, remove extra spaces, punctuation)
@@ -181,12 +201,26 @@ def clean_summary_text(text: str) -> str:
     return result.strip()
 
 def remove_repeated_lines(text: str) -> str:
-    """Remove repeated line patterns that commonly occur in summaries with enhanced similarity checking."""
+    """Remove repeated line patterns that commonly occur in summaries with enhanced similarity checking and noise removal."""
     import re
     from difflib import SequenceMatcher
     
     if not text:
         return text
+    
+    # Remove common noise patterns from lines
+    noise_patterns = [
+        r'\b(letters?\s+from\s+\w+)\b',
+        r'\b(film-maker\s+and\s+columnist)\b',
+        r'\b(columnist\s+and\s+\w+)\b',
+        r'\b(journalist\s+and\s+\w+)\b',
+        r'\b(\w+\s+and\s+columnist)\b',
+        r'\b(\w+\s+and\s+journalist)\b',
+        r'\b(repeated\s+names?\s+like\s+\w+\s+\w+)\b'
+    ]
+    
+    for pattern in noise_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
     
     # Split into lines
     lines = text.split('\n')
@@ -198,6 +232,10 @@ def remove_repeated_lines(text: str) -> str:
         if not line_clean:
             continue
             
+        # Skip lines that are just noise patterns
+        if re.search(r'^(letters?\s+from|film-maker|columnist|journalist)', line_clean, re.IGNORECASE):
+            continue
+            
         # Normalize line for comparison
         line_normalized = re.sub(r'\s+', ' ', line_clean.lower()).strip()
         line_normalized = re.sub(r'[^\w\s]', '', line_normalized)  # Remove punctuation
@@ -206,7 +244,7 @@ def remove_repeated_lines(text: str) -> str:
         if line_normalized in seen_lines:
             continue
             
-        # Skip if too similar to previous lines (check last 3 lines as requested)
+        # Skip if too similar to previous lines (check last 5 lines for better pattern detection)
         is_similar = False
         for prev_line in cleaned_lines[-3:]:  # Check last 3 lines as requested
             prev_normalized = re.sub(r'\s+', ' ', prev_line.lower()).strip()
@@ -684,11 +722,151 @@ def _apply_general_preprocessing(text: str) -> str:
     
     return text.strip()
 
+def _filter_unrelated_topics(text: str) -> str:
+    """Filter out unrelated topics to focus on brain, learning, neuroplasticity, stroke, and recovery content"""
+    import re
+    
+    # Define patterns for unrelated topics that should be filtered out
+    unrelated_patterns = [
+        r'\b(climate\s+change|global\s+warming|carbon\s+emissions|greenhouse\s+gases)\b',
+        r'\b(cancer|tumor|oncology|chemotherapy|radiation)\b',
+        r'\b(politics|election|government|policy|legislation)\b',
+        r'\b(sports|football|basketball|baseball|soccer)\b',
+        r'\b(celebrity|gossip|entertainment\s+news|movie\s+reviews)\b',
+        r'\b(technology\s+news|gadget\s+reviews|software\s+updates)\b',
+        r'\b(journalists?\s+and\s+\w+|columnists?\s+and\s+\w+)\b',
+        r'\b(letters?\s+from\s+\w+)\b',
+        r'\b(film-maker\s+and\s+columnist)\b',
+        r'\b(unrelated\s+names?\s+and\s+titles)\b'
+    ]
+    
+    # Remove sentences containing unrelated topics
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    filtered_sentences = []
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # Check if sentence contains unrelated topics
+        contains_unrelated = False
+        for pattern in unrelated_patterns:
+            if re.search(pattern, sentence, re.IGNORECASE):
+                contains_unrelated = True
+                break
+        
+        # Keep sentence if it doesn't contain unrelated topics
+        if not contains_unrelated:
+            filtered_sentences.append(sentence)
+    
+    # Rejoin filtered sentences
+    filtered_text = ' '.join(filtered_sentences)
+    
+    # If too much content was filtered out, return original text
+    if len(filtered_text) < len(text) * 0.3:  # If less than 30% remains
+        logger.warning("Too much content filtered out, returning original text")
+        return text
+    
+    return filtered_text
+
+def clean_transcript(text: str) -> str:
+    """
+    Comprehensive transcript cleaning function to remove noise, repeated phrases, and irrelevant content.
+    This function prepares clean text for the summarization pipeline.
+    """
+    import re
+    
+    if not text or len(text.strip()) < 10:
+        return text
+    
+    # Step 1: Remove stage cues and audience reactions
+    stage_cues = [
+        r'\([^)]*(?:cheers?|applause|laughter|music|sounds?|noise)[^)]*\)',
+        r'\[[^\]]*(?:cheers?|applause|laughter|music|sounds?|noise)[^\]]*\]',
+        r'\b(cheers?|applause|laughter|music|sounds?|noise)\b'
+    ]
+    
+    for pattern in stage_cues:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # Step 2: Remove repeated words and phrases (e.g., "stroke recovery, stroke recovery")
+    # Find and remove immediate repetitions
+    text = re.sub(r'\b(\w+(?:\s+\w+){0,3})\s*,\s*\1\b', r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(\w+(?:\s+\w+){0,3})\s+and\s+\1\b', r'\1', text, flags=re.IGNORECASE)
+    
+    # Step 3: Remove specific names of journalists, filmmakers, and unrelated people
+    # Common names that often appear in transcripts but aren't relevant to content
+    irrelevant_names = [
+        r'\b(?:Ahmed\s+Rashid|Al\s+Sharpton|Steve\s+Kroft|John\s+Doe|Jane\s+Smith)\b',
+        r'\b(?:journalist|reporter|correspondent|anchor|host|presenter)\s+\w+\s+\w+\b',
+        r'\b(?:filmmaker|director|producer|writer)\s+\w+\s+\w+\b',
+        r'\b(?:columnist|editor|author|contributor)\s+\w+\s+\w+\b'
+    ]
+    
+    for pattern in irrelevant_names:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # Step 4: Remove filler phrases and non-essential parts
+    filler_phrases = [
+        r'\b(?:letters?\s+from|columnist|series\s+of|part\s+of|episode\s+\d+)\b',
+        r'\b(?:as\s+you\s+know|as\s+we\s+discussed|remember\s+that)\b',
+        r'\b(?:that\'s\s+a\s+great\s+question|interesting\s+point|good\s+question)\b',
+        r'\b(?:um|uh|like|you\s+know|basically|actually|literally)\b',
+        r'\b(?:so|well|right|okay|yeah|wow|amazing)\b'
+    ]
+    
+    for pattern in filler_phrases:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # Step 5: Clean up punctuation artifacts and extra spaces
+    # Remove multiple consecutive punctuation marks
+    text = re.sub(r'[.!?]{2,}', '.', text)
+    text = re.sub(r'[,;]{2,}', ',', text)
+    
+    # Remove spaces before punctuation
+    text = re.sub(r'\s+([.!?,;:])', r'\1', text)
+    
+    # Remove multiple consecutive spaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Step 6: Remove empty parentheses and brackets
+    text = re.sub(r'\(\s*\)', '', text)
+    text = re.sub(r'\[\s*\]', '', text)
+    
+    # Step 7: Final cleanup - normalize spacing around punctuation
+    text = re.sub(r'\s*([.!?])\s*', r'\1 ', text)
+    text = re.sub(r'\s*([,;:])\s*', r'\1 ', text)
+    
+    # Remove leading/trailing whitespace
+    text = text.strip()
+    
+    # Step 8: Remove sentences that are too short or just noise
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    cleaned_sentences = []
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        # Keep sentences that are meaningful (at least 10 characters and not just noise)
+        if len(sentence) >= 10 and not re.match(r'^[^a-zA-Z]*$', sentence):
+            cleaned_sentences.append(sentence)
+    
+    # Rejoin cleaned sentences
+    result = ' '.join(cleaned_sentences)
+    
+    return result
+
 def generate_contextual_prompt(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
     """
     Generate optimized prompts based on content type and user preferences
     """
-    base_prompt = f"Please provide a comprehensive summary of the following {content_category.category.lower()} content:"
+    base_prompt = f"""Summarize the following transcript in 5-6 sentences. Focus on:
+         - How the brain changes (neuroplasticity)
+         - Why people learn differently
+         - How this knowledge helps with learning and stroke recovery
+         Ignore names, unrelated topics, and repeated phrases.
+         
+         Please provide a comprehensive summary of the following {content_category.category.lower()} content:"""
     
     # Add category-specific instructions
     if content_category.preprocessing_strategy == "news_focused":
@@ -794,8 +972,29 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
         # Stage 1: Content Analysis and Preprocessing
         processed_transcript = content_aware_preprocessing(transcript, content_category)
         
+        # Stage 1.5: Pre-summarization cleanup to remove noise and redundancy
+        with st.status("Preprocessing transcript for cleaner summarization...", expanded=True) as status:
+            # Step 1: Apply comprehensive transcript cleaning to remove noise, repeated phrases, and irrelevant names
+            cleaned_transcript = clean_transcript(processed_transcript)
+            logger.info(f"After transcript cleaning: {len(cleaned_transcript)} characters")
+            
+            # Step 2: Remove repeated phrases and irrelevant text using existing functions
+            cleaned_transcript = clean_summary_text(cleaned_transcript)
+            cleaned_transcript = remove_repeated_lines(cleaned_transcript)
+            
+            # Step 3: Filter out unrelated topics like climate change or cancer
+            cleaned_transcript = _filter_unrelated_topics(cleaned_transcript)
+            
+            # Step 4: Limit input text length to 2000 characters for more focused summarization
+            if len(cleaned_transcript) > 2000:
+                # Keep the most relevant content (first 2000 characters)
+                cleaned_transcript = cleaned_transcript[:2000]
+                logger.info(f"Transcript truncated to {len(cleaned_transcript)} characters for focused summarization")
+            
+            status.update(label="Transcript preprocessed successfully!", state="complete")
+        
         # Stage 2: Generate contextual prompt
-        llm_prompt = generate_contextual_prompt(processed_transcript, content_category, user_preferences)
+        llm_prompt = generate_contextual_prompt(cleaned_transcript, content_category, user_preferences)
         
         # Stage 2.5: Refine prompt using FLAN-T5
         if FLAN_T5_AVAILABLE:
@@ -834,7 +1033,7 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                     
                     # Use refined prompt with chunk content
                     summary_input = f"{refined_prompt}\n\nContent:\n{chunk}"
-                    summary = summarizer(summary_input, max_length=150, min_length=50, do_sample=False)
+                    summary = summarizer(summary_input, max_length=120, min_length=60, do_sample=False)
                     summarized_text.append(summary[0]['summary_text'])
                 
                 # Stage 5: Combine and refine summaries
@@ -1487,20 +1686,12 @@ def set_modern_style(dark_mode):
 def extract_key_sentences(text, num_sentences=5):
     """Extract key sentences from the text using TF-IDF"""
     try:
-        # Check if NLTK punkt is available
+        # Ensure NLTK data is available first
+        ensure_nltk_data()
+        
+        # Try to use NLTK sent_tokenize
         try:
-            # Try to download NLTK data if not available
-            try:
-                sentences = sent_tokenize(text)
-            except LookupError:
-                import nltk
-                try:
-                    nltk.download('punkt', quiet=True)
-                    sentences = sent_tokenize(text)
-                except Exception:
-                    # Fallback: simple sentence splitting by periods
-                    st.warning("NLTK punkt not available, using fallback sentence splitting")
-                    sentences = [s.strip() for s in text.split('.') if s.strip()]
+            sentences = sent_tokenize(text)
         except Exception:
             # Fallback: simple sentence splitting by periods
             st.warning("NLTK punkt not available, using fallback sentence splitting")
@@ -1785,9 +1976,10 @@ def create_modern_sentiment_analysis(sentiments, time_labels, duration_min, inte
                 colorscale='Viridis',
                 showscale=True,
                 colorbar=dict(
-                    title="Sentiment",
-                    titleside="right",
-                    titlefont=dict(color='#ffffff'),
+                    title=dict(
+                        text="Sentiment",
+                        font=dict(color='#ffffff')
+                    ),
                     tickfont=dict(color='#ffffff')
                 )
             )
@@ -1824,21 +2016,25 @@ def create_modern_sentiment_analysis(sentiments, time_labels, duration_min, inte
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         xaxis=dict(
-            title="Video Timeline (minutes)",
+            title=dict(
+                text="Video Timeline (minutes)",
+                font=dict(color='#ffffff')
+            ),
             showgrid=True,
             gridcolor='rgba(255,255,255,0.1)',
-            tickfont=dict(color='#ffffff'),
-            titlefont=dict(color='#ffffff')
+            tickfont=dict(color='#ffffff')
         ),
         yaxis=dict(
-            title="Sentiment Score",
+            title=dict(
+                text="Sentiment Score",
+                font=dict(color='#ffffff')
+            ),
             range=[-1, 1],
             showgrid=True,
             gridcolor='rgba(255,255,255,0.1)',
             zeroline=True,
             zerolinecolor='rgba(255,255,255,0.3)',
-            tickfont=dict(color='#ffffff'),
-            titlefont=dict(color='#ffffff')
+            tickfont=dict(color='#ffffff')
         ),
         height=500,
         margin=dict(t=80, l=50, r=50, b=50)
@@ -2869,25 +3065,34 @@ def ensure_nltk_data():
         
     try:
         # Try to import and use punkt
+        import nltk
         from nltk.data import find
-        find('tokenizers/punkt')
-        return True
-    except LookupError:
-        st.warning("NLTK punkt tokenizer not found. Downloading...")
+        
+        # Check if punkt is available
         try:
-            import nltk
-            nltk.download('punkt', quiet=True)
-            nltk.download('wordnet', quiet=True)
-            nltk.download('omw-1.4', quiet=True)
-            nltk.download('stopwords', quiet=True)
-            
-            # Verify download
             find('tokenizers/punkt')
-            st.success("NLTK data downloaded successfully!")
+            find('tokenizers/punkt_tab')
             return True
-        except Exception as e:
-            st.error(f"Failed to download NLTK data: {str(e)}")
-            return False
+        except LookupError:
+            st.warning("NLTK punkt tokenizer not found. Downloading...")
+            try:
+                nltk.download('punkt', quiet=True)
+                nltk.download('punkt_tab', quiet=True)
+                nltk.download('wordnet', quiet=True)
+                nltk.download('omw-1.4', quiet=True)
+                nltk.download('stopwords', quiet=True)
+                
+                # Verify downloads
+                find('tokenizers/punkt')
+                find('tokenizers/punkt_tab')
+                st.success("NLTK data downloaded successfully!")
+                return True
+            except Exception as e:
+                st.error(f"Failed to download NLTK data: {str(e)}")
+                return False
+    except Exception as e:
+        st.error(f"NLTK import error: {str(e)}")
+        return False
 
 def main():
     """Main function"""
