@@ -59,18 +59,37 @@ except Exception as e:
     FLAN_T5_AVAILABLE = False
 
 def refine_prompt(base_prompt: str) -> str:
-    """Refine a base prompt using FLAN-T5 model."""
+    """
+    Refine a base prompt using FLAN-T5 model with strict constraints to prevent hallucinations.
+    """
     # Check if FLAN-T5 is available
     if not FLAN_T5_AVAILABLE or refiner_tokenizer is None or refiner_model is None:
         logger.warning("FLAN-T5 model not available, skipping prompt refinement")
         return base_prompt
     
     try:
+        # Store original prompt for validation
+        original_prompt = base_prompt
+        original_length = len(base_prompt)
+        
         # Check if the prompt is too long and truncate if necessary
         if len(base_prompt) > 400:  # Leave room for the instruction
             base_prompt = base_prompt[:400] + "..."
         
-        input_text = f"Improve this instruction for better clarity and detail:\n\n{base_prompt}"
+        # Improved input with explicit constraints to prevent hallucinations
+        input_text = f"""Improve this instruction for clarity and conciseness, but do NOT add new topics or examples. Keep all details strictly within the context of the original instruction.
+
+Original instruction:
+{base_prompt}
+
+Constraints:
+- Do NOT introduce new topics, examples, or details that are not in the original instruction
+- Do NOT add references to unrelated concepts unless they are present in the original
+- Keep the same scope and meaning as the original
+- Focus only on improving clarity and structure
+
+Improved instruction:"""
+        
         inputs = refiner_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
         
         # Generate refined prompt
@@ -81,7 +100,8 @@ def refine_prompt(base_prompt: str) -> str:
                 min_length=20,
                 do_sample=False,
                 num_beams=4,
-                early_stopping=True
+                early_stopping=True,
+                temperature=0.3  # Lower temperature for more conservative generation
             )
         
         refined_prompt = refiner_tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -89,9 +109,44 @@ def refine_prompt(base_prompt: str) -> str:
         # Validate the refined prompt
         if not refined_prompt or len(refined_prompt.strip()) < 10:
             logger.warning("Refined prompt too short, using original")
-            return base_prompt
-            
-        logger.info(f"Prompt refined successfully. Original length: {len(base_prompt)}, Refined length: {len(refined_prompt)}")
+            return original_prompt
+        
+        # Validation: Check if refined prompt is too long (more than 20% longer)
+        refined_length = len(refined_prompt)
+        if refined_length > original_length * 1.2:
+            logger.warning(f"Refined prompt too long ({refined_length} vs {original_length}), using original")
+            return original_prompt
+        
+        # Validation: Check for introduction of new topics not in original
+        original_words = set(re.findall(r'\b\w+\b', original_prompt.lower()))
+        refined_words = set(re.findall(r'\b\w+\b', refined_prompt.lower()))
+        
+        # Check for potentially problematic new words (indicating hallucinations)
+        problematic_new_words = []
+        for word in refined_words - original_words:
+            # Check if new word might indicate hallucination
+            if word in ['stroke', 'recovery', 'neuroplasticity', 'brain', 'learning', 'therapy', 'treatment']:
+                # Only flag if these words weren't in the original context
+                if not any(context_word in original_words for context_word in ['brain', 'learning', 'education', 'teaching']):
+                    problematic_new_words.append(word)
+        
+        if problematic_new_words:
+            logger.warning(f"Refined prompt introduced potentially unrelated topics: {problematic_new_words}, using original")
+            return original_prompt
+        
+        # Validation: Check for excessive changes in meaning
+        # Simple heuristic: if more than 30% of words are new, it might be too different
+        new_word_ratio = len(refined_words - original_words) / len(refined_words) if refined_words else 0
+        if new_word_ratio > 0.3:
+            logger.warning(f"Refined prompt has too many new words ({new_word_ratio:.2%}), using original")
+            return original_prompt
+        
+        # Use the new validation function for additional safety
+        if not validate_refined_prompt(original_prompt, refined_prompt):
+            logger.warning("Refined prompt failed validation, using original")
+            return original_prompt
+        
+        logger.info(f"Prompt refined successfully. Original length: {original_length}, Refined length: {refined_length}")
         return refined_prompt
         
     except Exception as e:
@@ -859,11 +914,36 @@ def clean_transcript(text: str) -> str:
 def generate_contextual_prompt(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
     """
     Generate optimized prompts based on content type and user preferences
+    Dynamically extracts context from transcript instead of using hardcoded phrases
     """
-    base_prompt = f"""Summarize the following transcript in 5-6 sentences. Focus on:
-         - How the brain changes (neuroplasticity)
-         - Why people learn differently
-         - How this knowledge helps with learning and stroke recovery
+    # Extract key topics from transcript to create dynamic context
+    transcript_lower = transcript.lower()
+    
+    # Detect actual topics present in the transcript
+    detected_topics = []
+    topic_patterns = {
+        'brain_learning': [r'\b(brain|learning|education|teaching|study|knowledge)\b'],
+        'technology': [r'\b(technology|software|computer|digital|programming|coding)\b'],
+        'health_medical': [r'\b(health|medical|medicine|treatment|therapy|recovery)\b'],
+        'business': [r'\b(business|company|market|industry|finance|economics)\b'],
+        'science': [r'\b(science|research|experiment|discovery|scientific)\b'],
+        'news_events': [r'\b(news|event|announcement|update|report|coverage)\b'],
+        'entertainment': [r'\b(entertainment|movie|film|show|performance|art)\b']
+    }
+    
+    for topic_name, patterns in topic_patterns.items():
+        for pattern in patterns:
+            if re.search(pattern, transcript_lower):
+                detected_topics.append(topic_name)
+                break
+    
+    # Create dynamic base prompt based on detected topics
+    if detected_topics:
+        topic_context = f"Focus on the main topics: {', '.join(detected_topics)}"
+    else:
+        topic_context = "Focus on the key information and main points"
+    
+    base_prompt = f"""Summarize the following transcript in 5-6 sentences. {topic_context}.
          Ignore names, unrelated topics, and repeated phrases.
          
          Please provide a comprehensive summary of the following {content_category.category.lower()} content:"""
@@ -1002,7 +1082,18 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                 refined_prompt = refine_prompt(llm_prompt)
                 # Track if prompt refinement was used
                 st.session_state.prompt_refinement_used = refined_prompt != llm_prompt
-                status.update(label="Prompt refined successfully!", state="complete")
+                
+                # Additional safeguard: validate refined prompt
+                if refined_prompt != llm_prompt:
+                    if not validate_refined_prompt(llm_prompt, refined_prompt):
+                        logger.warning("Refined prompt failed validation, falling back to original")
+                        refined_prompt = llm_prompt
+                        st.session_state.prompt_refinement_used = False
+                        st.warning("⚠️ Prompt refinement failed validation - using original prompt")
+                    else:
+                        st.success("✅ Prompt refined and validated successfully!")
+                
+                status.update(label="Prompt refinement complete!", state="complete")
         else:
             # Skip refinement if FLAN-T5 is not available
             refined_prompt = llm_prompt
@@ -1063,8 +1154,14 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                     
                     status.update(label="Summary text cleaned!", state="complete")
                 
+                # Stage 5.6: Validate and remove hallucinations
+                with st.status("Validating summary for hallucinations...", expanded=True) as status:
+                    validated_summary = validate_and_clean_summary(cleaned_summary, cleaned_transcript, content_category)
+                    logger.info(f"After hallucination validation length: {len(validated_summary)}")
+                    status.update(label="Summary validated!", state="complete")
+                
                 # Stage 6: Post-processing and formatting
-                final_summary = _format_summary_by_category(cleaned_summary, content_category)
+                final_summary = _format_summary_by_category(validated_summary, content_category)
                 
                 status.update(label="Summary generated successfully!", state="complete")
                 return final_summary
@@ -3093,6 +3190,120 @@ def ensure_nltk_data():
     except Exception as e:
         st.error(f"NLTK import error: {str(e)}")
         return False
+
+def validate_refined_prompt(original_prompt: str, refined_prompt: str) -> bool:
+    """
+    Validate if the refined prompt is safe to use.
+    Returns True if safe, False if should fall back to original.
+    """
+    try:
+        # Check if refined prompt is too long (more than 20% longer)
+        if len(refined_prompt) > len(original_prompt) * 1.2:
+            logger.warning(f"Refined prompt too long ({len(refined_prompt)} vs {len(original_prompt)})")
+            return False
+        
+        # Check for introduction of new topics not in original
+        original_words = set(re.findall(r'\b\w+\b', original_prompt.lower()))
+        refined_words = set(re.findall(r'\b\w+\b', refined_prompt.lower()))
+        
+        # Check for potentially problematic new words
+        problematic_new_words = []
+        for word in refined_words - original_words:
+            # Check if new word might indicate hallucination
+            if word in ['stroke', 'recovery', 'neuroplasticity', 'brain', 'learning', 'therapy', 'treatment']:
+                # Only flag if these words weren't in the original context
+                if not any(context_word in original_words for context_word in ['brain', 'learning', 'education', 'teaching']):
+                    problematic_new_words.append(word)
+        
+        if problematic_new_words:
+            logger.warning(f"Refined prompt introduced potentially unrelated topics: {problematic_new_words}")
+            return False
+        
+        # Check for excessive changes in meaning
+        new_word_ratio = len(refined_words - original_words) / len(refined_words) if refined_words else 0
+        if new_word_ratio > 0.3:
+            logger.warning(f"Refined prompt has too many new words ({new_word_ratio:.2%})")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Prompt validation failed: {e}")
+        return False
+
+def validate_and_clean_summary(summary: str, original_transcript: str, content_category: ContentCategory) -> str:
+    """
+    Validate and clean the generated summary to remove hallucinations and ensure relevance.
+    """
+    if not summary or not original_transcript:
+        return summary
+    
+    try:
+        # Step 1: Apply existing cleanup functions
+        cleaned_summary = clean_summary_text(summary)
+        cleaned_summary = _filter_unrelated_topics(cleaned_summary)
+        
+        # Step 2: Remove hallucinated content by checking against original transcript
+        original_words = set(re.findall(r'\b\w+\b', original_transcript.lower()))
+        summary_sentences = re.split(r'(?<=[.!?])\s+', cleaned_summary)
+        validated_sentences = []
+        
+        for sentence in summary_sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # Check if sentence contains too many words not in original transcript
+            sentence_words = set(re.findall(r'\b\w+\b', sentence.lower()))
+            new_words = sentence_words - original_words
+            
+            # Calculate ratio of new words
+            new_word_ratio = len(new_words) / len(sentence_words) if sentence_words else 0
+            
+            # If more than 40% of words are new, the sentence might be hallucinated
+            if new_word_ratio > 0.4:
+                logger.warning(f"Removing potentially hallucinated sentence: {sentence[:50]}...")
+                continue
+            
+            # Check for specific hallucination patterns
+            hallucination_patterns = [
+                r'\b(stroke\s+recovery|neuroplasticity|brain\s+changes)\b',
+                r'\b(how\s+this\s+helps\s+with\s+learning)\b',
+                r'\b(why\s+people\s+learn\s+differently)\b'
+            ]
+            
+            contains_hallucination = False
+            for pattern in hallucination_patterns:
+                if re.search(pattern, sentence, re.IGNORECASE):
+                    # Only flag if these concepts aren't actually in the original transcript
+                    if not re.search(pattern, original_transcript, re.IGNORECASE):
+                        contains_hallucination = True
+                        break
+            
+            if contains_hallucination:
+                logger.warning(f"Removing sentence with hallucinated content: {sentence[:50]}...")
+                continue
+            
+            validated_sentences.append(sentence)
+        
+        # Step 3: Reconstruct summary
+        final_summary = " ".join(validated_sentences)
+        
+        # Step 4: Ensure summary is not too short
+        if len(final_summary) < len(summary) * 0.5:  # If less than 50% remains
+            logger.warning("Too much content removed during validation, using original cleaned summary")
+            return cleaned_summary
+        
+        # Step 5: Final cleanup
+        final_summary = re.sub(r'\s+', ' ', final_summary).strip()
+        final_summary = re.sub(r'\.{2,}', '.', final_summary)
+        
+        logger.info(f"Summary validation complete. Original: {len(summary)}, Final: {len(final_summary)}")
+        return final_summary
+        
+    except Exception as e:
+        logger.error(f"Summary validation failed: {e}")
+        return summary  # Return original if validation fails
 
 def main():
     """Main function"""
