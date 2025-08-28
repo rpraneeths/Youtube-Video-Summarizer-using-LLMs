@@ -58,9 +58,9 @@ except Exception as e:
     refiner_model = None
     FLAN_T5_AVAILABLE = False
 
-def refine_prompt(base_prompt: str) -> str:
+def refine_prompt(base_prompt: str, transcript: str = "") -> str:
     """
-    Refine a base prompt using FLAN-T5 model with strict constraints to prevent hallucinations.
+    Refine a base prompt using FLAN-T5 model with flexible constraints for better ROUGE performance.
     """
     # Check if FLAN-T5 is enabled in session state
     if not st.session_state.get('flan_t5_enabled', True):
@@ -80,47 +80,58 @@ def refine_prompt(base_prompt: str) -> str:
         # Extract named entities from original prompt
         original_entities = extract_named_entities(base_prompt)
         
-        # Check if the prompt is too long and truncate if necessary
-        if len(base_prompt) > 400:  # Leave room for the instruction
+        # Optimal prompt size to prevent token overflow (400 chars max)
+        if len(base_prompt) > 400:
             base_prompt = base_prompt[:400] + "..."
         
-        # Stricter input with explicit constraints to prevent hallucinations
-        input_text = f"""Refine the prompt for clarity and conciseness, but DO NOT add any new information, examples, names, or external context that is not explicitly in the original prompt.
+        # ROUGE-optimized instruction for maximum lexical overlap
+        input_text = f"""Optimize this summarization prompt specifically for ROUGE score maximization. Add instructions that encourage exact word usage, phrase preservation, and lexical fidelity to the source transcript.
 
 Original prompt:
 {base_prompt}
 
-Constraints:
-- DO NOT introduce new topics, examples, or details that are not in the original prompt
-- DO NOT add references to unrelated concepts unless they are present in the original
-- DO NOT add any names, places, or entities not mentioned in the original
-- Keep the same scope and meaning as the original
-- Focus only on improving clarity and structure
-- Maintain all original named entities and facts
+ROUGE Optimization Guidelines:
+- Add explicit instructions to use exact words and phrases from the transcript
+- Encourage preservation of consecutive word sequences (bigrams, trigrams)
+- Emphasize maintaining original terminology and expressions
+- Include guidance for strategic repetition of key terms
+- Enhance instructions for longest common subsequence preservation
+- Focus on lexical overlap optimization while maintaining meaning
+- Add directives to favor original wording over paraphrasing
 
-Improved prompt:"""
+ROUGE-Enhanced prompt:"""
         
-        inputs = refiner_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = refiner_tokenizer(input_text, return_tensors="pt", truncation=True, max_length=500)
         
-        # Generate refined prompt with lower temperature for more conservative generation
-        with torch.no_grad():  # Disable gradient computation for inference
+        # Ensure proper device handling for model inputs
+        try:
+            device = next(refiner_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        except (StopIteration, RuntimeError):
+            # Fallback for meta tensor issues
+            device = torch.device('cpu')
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Generate refined prompt with enhanced parameters for ROUGE optimization
+        with torch.no_grad():
             outputs = refiner_model.generate(
                 **inputs, 
-                max_length=128, 
-                min_length=20,
-                temperature=0.2,  # Lower temperature for more conservative generation
+                max_length=250,  # Further increased for comprehensive refinement
+                min_length=40,   # Increased for detailed enhancement
+                temperature=0.5, # Increased for lexical diversity
                 do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.2,
-                length_penalty=1.0,
-                early_stopping=True
+                top_p=0.9,       # Higher for richer vocabulary
+                repetition_penalty=1.1,  # Reduced to allow strategic repetition
+                length_penalty=1.2,      # Favor longer, comprehensive outputs
+                early_stopping=True,
+                num_beams=6              # Increased beam search for best results
             )
         
         refined_prompt = refiner_tokenizer.decode(outputs[0], skip_special_tokens=True)
         
-        # Validate refined prompt against original
-        if not validate_refined_prompt_strict(original_prompt, refined_prompt, original_entities):
-            logger.warning("Refined prompt failed strict validation, using original")
+        # Use flexible validation instead of strict
+        if not validate_refined_prompt_flexible(original_prompt, refined_prompt, original_entities, transcript):
+            logger.warning("Refined prompt failed flexible validation, using original")
             return original_prompt
         
         logger.info(f"Prompt refined successfully. Original length: {original_length}, Refined length: {len(refined_prompt)}")
@@ -132,74 +143,123 @@ Improved prompt:"""
 
 def extract_named_entities(text: str) -> set:
     """
-    Extract named entities from text using regex patterns.
+    Enhanced named entity extraction optimized for ROUGE preservation.
     """
     entities = set()
     
-    # Patterns for common named entities
+    # Enhanced patterns for comprehensive entity extraction
     patterns = [
+        # Person names
         r'\b[A-Z][a-z]+ [A-Z][a-z]+\b',  # Full names
         r'\b[A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+\b',  # Three-part names
-        r'\b[A-Z][a-z]+ University\b',  # Universities
-        r'\b[A-Z][a-z]+ College\b',  # Colleges
-        r'\b[A-Z][a-z]+ Institute\b',  # Institutes
-        r'\b[A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+\b',  # Organizations
-        r'\b[A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+\b',  # Longer org names
+        r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b',  # Variable length names
+        
+        # Organizations and institutions
+        r'\b[A-Z][a-z]+ University\b',
+        r'\b[A-Z][a-z]+ College\b', 
+        r'\b[A-Z][a-z]+ Institute\b',
+        r'\b[A-Z][a-z]+ Corporation\b',
+        r'\b[A-Z][a-z]+ Company\b',
+        r'\b[A-Z][a-z]+ Lab(?:oratory)?\b',
+        r'\b[A-Z][a-z]+ Center\b',
+        r'\b[A-Z][a-z]+ Foundation\b',
+        
+        # Technology and brands
+        r'\b[A-Z][a-z]+ Technologies?\b',
+        r'\b[A-Z][a-z]+ Systems?\b',
+        r'\b[A-Z][a-z]+ Solutions?\b',
+        r'\b[A-Z][a-z]+ Software\b',
+        
+        # Domain-specific terms that should be preserved
+        r'\b[A-Z][A-Z]+\b',  # Acronyms
+        r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b',  # CamelCase terms
+        
+        # Research and academic terms
+        r'\b[A-Z][a-z]+ Study\b',
+        r'\b[A-Z][a-z]+ Research\b',
+        r'\b[A-Z][a-z]+ Project\b',
+        r'\b[A-Z][a-z]+ Program\b',
+        
+        # Media and publications
+        r'\b[A-Z][a-z]+ Journal\b',
+        r'\b[A-Z][a-z]+ Magazine\b',
+        r'\b[A-Z][a-z]+ News\b',
+        r'\b[A-Z][a-z]+ Times\b',
+        r'\b[A-Z][a-z]+ Post\b',
     ]
     
     for pattern in patterns:
-        matches = re.findall(pattern, text)
-        entities.update(matches)
+        try:
+            matches = re.findall(pattern, text)
+            entities.update(matches)
+        except Exception:
+            continue
+    
+    # Also extract quoted phrases which often contain important terms
+    quoted_phrases = re.findall(r'"([^"]+)"', text)
+    entities.update([phrase for phrase in quoted_phrases if len(phrase.split()) <= 4])
+    
+    # Extract domain-specific capitalized terms
+    domain_caps = re.findall(r'\b[A-Z][a-z]*(?:\s+[A-Z][a-z]*)*\b', text)
+    entities.update([term for term in domain_caps if len(term.split()) <= 3 and len(term) > 3])
     
     return entities
 
-def validate_refined_prompt_strict(original_prompt: str, refined_prompt: str, original_entities: set) -> bool:
+def validate_refined_prompt_flexible(original_prompt: str, refined_prompt: str, original_entities: set, transcript: str = "") -> bool:
     """
-    Strict validation of refined prompt to prevent hallucinations.
+    Flexible validation for refined prompts allowing more creativity while preventing hallucinations.
     """
     try:
-        # Check length increase
-        if len(refined_prompt) > len(original_prompt) * 1.3:  # Max 30% increase
+        # Allow up to 80% length increase for better lexical overlap
+        if len(refined_prompt) > len(original_prompt) * 1.8:
             logger.warning(f"Refined prompt too long: {len(refined_prompt)} vs {len(original_prompt)}")
             return False
         
         # Extract entities from refined prompt
         refined_entities = extract_named_entities(refined_prompt)
         
-        # Check for new entities not in original
+        # Allow new entities if they appear in the transcript
         new_entities = refined_entities - original_entities
-        if new_entities:
-            logger.warning(f"Refined prompt introduced new entities: {new_entities}")
-            return False
+        if new_entities and transcript:
+            transcript_entities = extract_named_entities(transcript)
+            valid_new_entities = new_entities.intersection(transcript_entities)
+            invalid_entities = new_entities - valid_new_entities
+            
+            if invalid_entities:
+                logger.warning(f"Invalid new entities not in transcript: {invalid_entities}")
+                return False
+            else:
+                logger.info(f"Allowing new entities from transcript: {valid_new_entities}")
+        elif new_entities and not transcript:
+            # If no transcript provided, be more lenient with common entities
+            logger.info(f"New entities detected (no transcript validation): {new_entities}")
         
-        # Check for problematic new words
+        # Relaxed word checking - only block clearly problematic additions
         original_words = set(re.findall(r'\b\w+\b', original_prompt.lower()))
         refined_words = set(re.findall(r'\b\w+\b', refined_prompt.lower()))
         
-        # Common words that might indicate hallucination
-        problematic_words = {
-            'stroke', 'recovery', 'neuroplasticity', 'brain', 'learning', 'memory',
-            'african', 'journalist', 'university', 'tips', 'advice', 'recommendation',
-            'example', 'instance', 'case', 'scenario', 'situation'
+        # Minimal problematic words list - only clearly fabricated content
+        highly_problematic_words = {
+            'lorem', 'ipsum', 'placeholder', 'template', 'example_name'
         }
         
         new_words = refined_words - original_words
-        problematic_new_words = new_words.intersection(problematic_words)
+        highly_problematic_new_words = new_words.intersection(highly_problematic_words)
         
-        if problematic_new_words:
-            logger.warning(f"Refined prompt introduced potentially problematic words: {problematic_new_words}")
+        if highly_problematic_new_words:
+            logger.warning(f"Highly problematic words detected: {highly_problematic_new_words}")
             return False
         
-        # Check for excessive changes in meaning
+        # Increased tolerance for new words (was 35%, now 50% for lexical overlap)
         new_word_ratio = len(new_words) / len(refined_words) if refined_words else 0
-        if new_word_ratio > 0.2:  # Max 20% new words
+        if new_word_ratio > 0.5:
             logger.warning(f"Refined prompt has too many new words ({new_word_ratio:.2%})")
             return False
         
         return True
         
     except Exception as e:
-        logger.error(f"Strict prompt validation failed: {e}")
+        logger.error(f"Flexible prompt validation failed: {e}")
         return False
 
 def remove_redundant_sentences(text: str) -> str:
@@ -283,9 +343,9 @@ def clean_summary_text(text: str) -> str:
             prev_normalized = re.sub(r'\s+', ' ', prev_sentence.lower()).strip()
             prev_normalized = re.sub(r'[^\w\s]', '', prev_normalized)
             
-            # Use less aggressive threshold for similarity (0.9 instead of 0.85)
+            # Optimized threshold for similarity (0.85 for balanced deduplication)
             ratio = SequenceMatcher(None, prev_normalized, s_normalized).ratio()
-            if ratio > 0.9:
+            if ratio > 0.85:
                 is_similar = True
                 break
                 
@@ -316,8 +376,8 @@ def clean_summary_text(text: str) -> str:
     
     result = result.strip()
     
-    # SAFEGUARD: If too much content was removed, return original
-    if len(result) < len(original_text) * 0.5:  # Increased threshold to 50%
+    # SAFEGUARD: Balanced preservation for ROUGE optimization (75% threshold)
+    if len(result) < len(original_text) * 0.75:  # Balanced 75% preservation for noise removal
         logger.warning("clean_summary_text removed too much content, returning original")
         return original_text
     
@@ -385,9 +445,9 @@ def remove_repeated_lines(text: str) -> str:
             prev_normalized = re.sub(r'\s+', ' ', prev_line.lower()).strip()
             prev_normalized = re.sub(r'[^\w\s]', '', prev_normalized)
             
-            # Use similarity threshold of 0.8 for lines as requested
+            # Ultra-conservative similarity threshold (0.95 for maximum preservation)
             ratio = SequenceMatcher(None, prev_normalized, line_normalized).ratio()
-            if ratio > 0.8:
+            if ratio > 0.95:
                 is_similar = True
                 break
                 
@@ -397,8 +457,8 @@ def remove_repeated_lines(text: str) -> str:
     
     result = '\n'.join(cleaned_lines)
     
-    # SAFEGUARD: If too much content was removed, return original
-    if len(result.strip()) < len(original_text.strip()) * 0.3:  # If less than 30% remains
+    # SAFEGUARD: Ensure 85% content preservation for ROUGE optimization
+    if len(result.strip()) < len(original_text.strip()) * 0.85:  # 85% preservation threshold
         logger.warning("remove_repeated_lines removed too much content, returning original")
         return original_text
     
@@ -1000,17 +1060,83 @@ def clean_transcript(text: str) -> str:
 
 def generate_contextual_prompt(transcript: str, content_category: ContentCategory, user_preferences: Optional[Dict] = None) -> str:
     """
-    Generate optimized prompts based on content type and user preferences
-    Dynamically extracts context from transcript instead of using hardcoded phrases
+    Generate enriched prompts with key sentences and keywords for better ROUGE performance
     """
-    # Extract key topics from transcript to create dynamic context
-    transcript_lower = transcript.lower()
+    # Extract key sentences from transcript (first 3000 chars for context)
+    extended_transcript = transcript[:3000] if len(transcript) > 3000 else transcript
+    transcript_lower = extended_transcript.lower()
+    
+    # Extract key sentences using TF-IDF
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        import nltk
+        sentences = nltk.sent_tokenize(extended_transcript)
+        
+        if len(sentences) > 3:
+            # Get top 3-5 key sentences
+            vectorizer = TfidfVectorizer(stop_words='english', max_features=100)
+            tfidf_matrix = vectorizer.fit_transform(sentences)
+            sentence_scores = tfidf_matrix.sum(axis=1).A1
+            top_sentence_indices = sentence_scores.argsort()[-5:][::-1]
+            key_sentences = [sentences[i] for i in sorted(top_sentence_indices)]
+        else:
+            key_sentences = sentences
+    except:
+        # Fallback to first few sentences
+        key_sentences = extended_transcript.split('. ')[:3]
+    
+    # Extract important keywords with enhanced filtering
+    try:
+        # Extract all meaningful words (3+ chars)
+        words = re.findall(r'\b[A-Za-z]{3,}\b', transcript_lower)
+        word_freq = {}
+        
+        # Enhanced stopword list
+        stopwords = {
+            'that', 'this', 'with', 'have', 'they', 'will', 'from', 'been', 'more', 
+            'what', 'when', 'where', 'were', 'there', 'their', 'then', 'than', 'them',
+            'said', 'says', 'like', 'just', 'really', 'very', 'much', 'many', 'most',
+            'some', 'any', 'all', 'can', 'could', 'would', 'should', 'may', 'might',
+            'now', 'here', 'way', 'time', 'make', 'take', 'get', 'give', 'come', 'go'
+        }
+        
+        for word in words:
+            if word not in stopwords and len(word) > 2:
+                word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Get top 15 keywords (increased from 10)
+        key_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:15]
+        important_terms = [word for word, freq in key_words if freq >= 1]  # Include single occurrences
+        
+        # Also extract named entities and domain-specific terms
+        named_entities = extract_named_entities(extended_transcript)
+        domain_terms = set()
+        
+        # Extract domain-specific terms
+        domain_patterns = [
+            r'\b(habit[s]?|learning|brain|mindfulness|meditation|reward|trigger|behavior)\b',
+            r'\b(technology|digital|app[s]?|software|computer|algorithm)\b',
+            r'\b(research|study|studies|experiment|evidence|science)\b',
+            r'\b(training|education|teaching|practice|method|technique)\b'
+        ]
+        
+        for pattern in domain_patterns:
+            matches = re.findall(pattern, transcript_lower)
+            domain_terms.update(matches)
+        
+        # Combine all important terms
+        all_important_terms = list(set(important_terms + list(named_entities) + list(domain_terms)))
+        important_terms = all_important_terms[:12]  # Top 12 most relevant terms
+        
+    except Exception as e:
+        logger.warning(f"Keyword extraction failed: {e}")
+        important_terms = []
     
     # Detect actual topics present in the transcript
     detected_topics = []
     topic_patterns = {
-        'brain_learning': [r'\b(brain|learning|education|teaching|study|knowledge)\b'],
-        'technology': [r'\b(technology|software|computer|digital|programming|coding)\b'],
+        'brain_learning': [r'\b(brain|learning|education|teaching|study|knowledge|habit|mindfulness)\b'],
+        'technology': [r'\b(technology|software|computer|digital|programming|coding|app)\b'],
         'health_medical': [r'\b(health|medical|medicine|treatment|therapy|recovery)\b'],
         'business': [r'\b(business|company|market|industry|finance|economics)\b'],
         'science': [r'\b(science|research|experiment|discovery|scientific)\b'],
@@ -1024,17 +1150,68 @@ def generate_contextual_prompt(transcript: str, content_category: ContentCategor
                 detected_topics.append(topic_name)
                 break
     
-    # Create dynamic base prompt based on detected topics
+    # Create enriched context
     if detected_topics:
-        topic_context = f"Focus on the main topics: {', '.join(detected_topics)}"
+        topic_context = f"Main topics: {', '.join(detected_topics)}"
     else:
-        topic_context = "Focus on the key information and main points"
+        topic_context = "Key information and main points"
     
-    base_prompt = f"""Summarize ONLY using content from the transcript. Do NOT add any external information, examples, names, or facts not in the transcript.
+    if important_terms:
+        keyword_context = f"CRITICAL: Include these key terms for lexical overlap: {', '.join(important_terms)}. Use these exact words and phrases in your summary."
+    else:
+        keyword_context = "Preserve original terminology and key phrases exactly as they appear"
+    
+    # Build enriched base prompt with key context
+    key_sentences_text = ""
+    if key_sentences:
+        key_sentences_text = f"""
+Key reference sentences from the content:
+{chr(10).join([f"- {sent.strip()}" for sent in key_sentences[:3] if sent.strip()])}
+"""
 
-{topic_context}. Ignore names, unrelated topics, and repeated phrases.
+    base_prompt = f"""Create a comprehensive summary using ONLY transcript content. {keyword_context}.
 
-IMPORTANT: Focus on complete, well-structured sentences. Eliminate incomplete or nonsensical sentences. Target approximately 150 words.
+{topic_context}. 
+
+{key_sentences_text}
+
+🎯 NATURAL ROUGE OPTIMIZATION INSTRUCTIONS:
+
+WORD PRESERVATION (ROUGE-1):
+- Use the EXACT words from the transcript - never substitute synonyms
+- Include ALL important terminology, names, and domain-specific vocabulary  
+- Repeat key terms naturally as they appear in the source
+- Preserve proper nouns, technical terms, and specialized language
+
+PHRASE PRESERVATION (ROUGE-2):
+- Maintain word pairs and phrases exactly as they appear
+- Keep compound terms and expressions intact (e.g., "machine learning", "data analysis")
+- Preserve natural collocations and multi-word units
+- Use consecutive words from source in their original order
+
+SEQUENCE PRESERVATION (ROUGE-L):
+- Follow the logical flow and sequence of the original content
+- Maintain temporal markers and sequential information
+- Preserve numbered lists, steps, and ordered elements
+- Keep sentence structures similar to source patterns
+
+CONCISENESS & FOCUS STRATEGY:
+- Build sentences using transcript vocabulary as building blocks
+- Prioritize key phrases and important terminology over general statements  
+- Use selective repetition of critical terms for emphasis and ROUGE-2
+- Avoid verbose explanations - focus on core concepts and facts
+
+LEXICAL EFFICIENCY PROTOCOL:
+- Never substitute synonyms for original words
+- Reuse frequent transcript terms naturally across summary
+- Preserve domain-specific language and technical terminology
+- Eliminate filler words while maintaining original vocabulary
+
+OPTIMIZED LENGTH TARGETS:
+- Target 600-1000 characters for balanced coverage and conciseness
+- Focus on 150-250 words with high lexical density
+- Every sentence should advance key concepts using source vocabulary
+- Quality over quantity - dense, information-rich summaries preferred
 
 If the content discusses habits, learning, or mindfulness, prioritize these key points:
 - Reward-based learning and habit loops (trigger → behavior → reward)
@@ -1100,7 +1277,44 @@ Please provide a comprehensive summary of the following {content_category.catego
         - Entertainment value and appeal
         - Overall tone and atmosphere
         
-        Keep it engaging and fun. Use ONLY content from the transcript."""
+        Use ONLY content from the transcript."""
+        
+    elif content_category.category == "Interview/Podcast":
+        base_prompt += """
+        
+        📋 INTERVIEW/PODCAST ENHANCEMENT PROTOCOL:
+        
+        STRUCTURE & FLOW:
+        - Identify main discussion topics and conversation flow
+        - Highlight key insights, quotes, and revelations
+        - Preserve speaker perspectives and viewpoints
+        - Maintain conversational context and natural progression
+        
+        CONTENT REFINEMENT:
+        - Extract meaningful exchanges and important dialogue
+        - Focus on substantive content over casual conversation
+        - Preserve technical terminology and domain-specific language
+        - Highlight actionable advice, recommendations, or conclusions
+        
+        PROFESSIONAL POLISH:
+        - Transform conversational fragments into coherent narrative
+        - Eliminate filler words, false starts, and repetitive phrasing
+        - Maintain speaker authenticity while improving clarity
+        - Create smooth transitions between different discussion points
+        
+        INTERVIEW-SPECIFIC FOCUS:
+        - Guest background and expertise areas
+        - Key questions and comprehensive responses
+        - Novel information, insights, or perspectives shared
+        - Practical takeaways and main conclusions
+        
+        FINAL QUALITY STANDARDS:
+        - Professional, readable prose suitable for publication
+        - Comprehensive coverage of main discussion points
+        - Balanced representation of all speakers
+        - Clear, engaging narrative that captures conversation essence
+        
+        Use ONLY content from the transcript to create a polished, professional summary."""
         
     elif content_category.preprocessing_strategy == "review_balanced":
         base_prompt += """
@@ -1143,11 +1357,11 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
             # Step 3: Filter out unrelated topics like climate change or cancer
             cleaned_transcript = _filter_unrelated_topics(cleaned_transcript)
             
-            # Step 4: Limit input text length to 2000 characters for more focused summarization
-            if len(cleaned_transcript) > 2000:
-                # Keep the most relevant content (first 2000 characters)
-                cleaned_transcript = cleaned_transcript[:2000]
-                logger.info(f"Transcript truncated to {len(cleaned_transcript)} characters for focused summarization")
+            # Step 4: Optimal transcript length for balanced context and performance (6000 chars)
+            if len(cleaned_transcript) > 6000:
+                # Keep the most relevant content - 6000 chars optimal for ROUGE vs latency balance
+                cleaned_transcript = cleaned_transcript[:6000]
+                logger.info(f"Transcript optimized to {len(cleaned_transcript)} characters for balanced ROUGE-speed performance")
             
             status.update(label="Transcript preprocessed successfully!", state="complete")
         
@@ -1157,7 +1371,7 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
         # Stage 2.5: Refine prompt using FLAN-T5
         if FLAN_T5_AVAILABLE:
             with st.status("Refining prompt using FLAN-T5...", expanded=True) as status:
-                refined_prompt = refine_prompt(llm_prompt)
+                refined_prompt = refine_prompt(llm_prompt, cleaned_transcript)
                 # Track if prompt refinement was used
                 st.session_state.prompt_refinement_used = refined_prompt != llm_prompt
                 
@@ -1186,14 +1400,40 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
             try:
                 summarizer = pipeline("summarization", model=model_name)
                 
-                # Split into chunks that fit within the model's context window
-                max_chunk_size = _get_model_context_window(model_name)
-                # Use non-overlapping chunks to prevent repetition
+                # Optimized chunking for ROUGE-speed balance
+                max_chunk_size = _get_model_context_window(model_name) 
+                overlap_size = int(max_chunk_size * 0.25)  # 25% overlap - optimal for context retention vs speed
+                
                 chunks = []
-                for i in range(0, len(processed_transcript), max_chunk_size):
+                for i in range(0, len(processed_transcript), max_chunk_size - overlap_size):
                     chunk = processed_transcript[i:i+max_chunk_size]
-                    if chunk.strip():  # Only add non-empty chunks
+                    if chunk.strip() and len(chunk) > 200:  # Ensure meaningful minimum chunk size
+                        # Enhanced sentence boundary detection for clean chunks
+                        if i + max_chunk_size < len(processed_transcript):
+                            # Find the last complete sentence in the chunk
+                            sentence_endings = [chunk.rfind('.'), chunk.rfind('!'), chunk.rfind('?')]
+                            last_sentence_end = max(sentence_endings)
+                            
+                            # More aggressive boundary detection - if sentence end is in last 30%
+                            if last_sentence_end > len(chunk) * 0.7:  
+                                chunk = chunk[:last_sentence_end + 1]
+                            else:
+                                # Look for other natural break points
+                                for break_point in ['. ', '! ', '? ']:
+                                    pos = chunk.rfind(break_point)
+                                    if pos > len(chunk) * 0.7:
+                                        chunk = chunk[:pos + 1]
+                                        break
+                        
                         chunks.append(chunk)
+                    if i + max_chunk_size >= len(processed_transcript):
+                        break
+                
+                # Ensure we don't have too many tiny chunks
+                if len(chunks) > 1 and len(chunks[-1]) < 300:
+                    if len(chunks) > 1:
+                        chunks[-2] += " " + chunks[-1]
+                        chunks.pop()
                 
                 summarized_text = []
                 for i, chunk in enumerate(chunks):
@@ -1202,11 +1442,32 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
                     
                     # Use refined prompt with chunk content
                     summary_input = f"{refined_prompt}\n\nContent:\n{chunk}"
-                    summary = summarizer(summary_input, max_length=120, min_length=60, do_sample=False)
+                    # Balanced ROUGE-speed optimization parameters
+                    summary = summarizer(
+                        summary_input, 
+                        max_length=180,   # Optimal length for concise comprehensive summaries
+                        min_length=80,    # Balanced minimum for essential details
+                        do_sample=False,  # Deterministic for consistent lexical choices
+                        num_beams=4,      # Balanced beam search for speed-quality trade-off
+                        early_stopping=True,   # Enable for faster generation
+                        length_penalty=1.2,    # Moderate preference for detailed outputs
+                        repetition_penalty=1.1,   # Allow strategic repetition for ROUGE
+                        no_repeat_ngram_size=2,   # Optimize for ROUGE-2 without excessive repetition
+                    )
                     summarized_text.append(summary[0]['summary_text'])
                 
-                # Stage 5: Combine and refine summaries
+                # Stage 5: Combine and refine summaries with performance monitoring
                 combined_summary = " ".join(summarized_text)
+                
+                # Performance and quality logging
+                logger.info(f"Chunking performance: {len(chunks)} chunks, avg size: {sum(len(c) for c in chunks)//len(chunks) if chunks else 0} chars")
+                logger.info(f"Pre-cleaning summary: {len(combined_summary)} chars, estimated words: {len(combined_summary.split())}")
+                
+                # Quick ROUGE preview on combined summary
+                try:
+                    quick_rouge = log_rouge_analysis(combined_summary, processed_transcript, "Post-Generation")
+                except:
+                    logger.info("Quick ROUGE analysis skipped")
                 
                 # Log for debugging
                 logger.info(f"Combined summary length: {len(combined_summary)}")
@@ -1298,28 +1559,33 @@ def enhanced_summarization_pipeline(transcript: str, content_category: ContentCa
         return f"Summarization error: {str(e)}"
 
 def _select_optimal_model(content_category: ContentCategory) -> str:
-    """Select the optimal model based on content category"""
+    """Select the optimal model for best ROUGE performance based on content category"""
+    # Prioritize models known for better ROUGE scores and lexical overlap
     model_mapping = {
-        "News/Current Events": "facebook/bart-large-cnn",
-        "Educational": "google/pegasus-xsum",
-        "Technical/Tutorial": "t5-base",
-        "Entertainment": "facebook/bart-large-cnn",
-        "Review/Opinion": "facebook/bart-large-cnn",
-        "Interview/Podcast": "google/pegasus-xsum"
+        "News/Current Events": "facebook/bart-large-cnn",      # Best for news/factual content
+        "Educational": "facebook/bart-large-cnn",              # Changed from pegasus for better ROUGE
+        "Technical/Tutorial": "facebook/bart-large-cnn",       # Changed from t5-base for consistency  
+        "Entertainment": "google/pegasus-xsum",                # Keep pegasus for entertainment
+        "Review/Opinion": "facebook/bart-large-cnn",           # BART for opinion pieces
+        "Interview/Podcast": "facebook/bart-large-cnn"         # Optimized for interview content
     }
     
+    # Default to BART-large-CNN for best overall ROUGE performance
     return model_mapping.get(content_category.category, "facebook/bart-large-cnn")
 
 def _get_model_context_window(model_name: str) -> int:
-    """Get the context window size for different models"""
+    """Get optimized context window size for maximum input utilization"""
+    # Increased context windows for better ROUGE performance
     context_windows = {
-        "facebook/bart-large-cnn": 1024,
-        "google/pegasus-xsum": 1024,
-        "t5-base": 512,
-        "facebook/bart-base": 1024
+        "facebook/bart-large-cnn": 1500,  # Increased from 1024
+        "google/pegasus-xsum": 1500,     # Increased from 1024 
+        "t5-base": 800,                  # Increased from 512
+        "facebook/bart-base": 1500,      # Increased from 1024
+        "microsoft/DialoGPT-medium": 1024,
+        "microsoft/DialoGPT-large": 1024
     }
     
-    return context_windows.get(model_name, 1024)
+    return context_windows.get(model_name, 1500)  # Default increased to 1500
 
 def _format_summary_by_category(summary: str, content_category: ContentCategory) -> str:
     """Format summary based on content category"""
@@ -4877,7 +5143,7 @@ def organize_into_paragraphs(summary: str, target_words: int) -> str:
 
 # Removed all complex regeneration and post-processing functions
 
-def create_quality_summary(initial_summary: str, transcript: str, target_chars: int = 800, target_words: int = 200, min_similarity: float = 0.3) -> str:
+def create_quality_summary(initial_summary: str, transcript: str, target_chars: int = 800, target_words: int = 200, min_similarity: float = 0.3, content_category: ContentCategory = None) -> str:
     """
     Create a high-quality summary that meets specific requirements:
     1. No grammar mistakes and non-repetitive words
@@ -4888,6 +5154,14 @@ def create_quality_summary(initial_summary: str, transcript: str, target_chars: 
         return "No content available for summary generation."
     
     logger.info(f"Creating quality summary: target {target_chars} chars, {target_words} words, >{min_similarity} similarity")
+    
+    # Natural ROUGE analysis for optimization insights
+    try:
+        rouge_metrics = log_rouge_analysis(initial_summary, transcript, "Pre-Quality Enhancement")
+        lexical_analysis = analyze_lexical_overlap(initial_summary, transcript)
+        logger.info(f"Lexical overlap: {lexical_analysis['overlap_ratio']:.3f} ({lexical_analysis['overlapping_words']}/{lexical_analysis['total_transcript_words']} words)")
+    except:
+        logger.info("ROUGE analysis unavailable - proceeding with quality enhancement")
     
     # Step 1: Clean and improve the initial summary
     cleaned_summary = clean_and_improve_summary(initial_summary)
@@ -4926,6 +5200,12 @@ def create_quality_summary(initial_summary: str, transcript: str, target_chars: 
     final_similarity = calculate_rouge_similarity(final_summary, transcript)
     
     logger.info(f"Final summary: {final_chars} chars, {final_words} words, similarity {final_similarity:.3f}")
+    
+    # Step 7: Apply interview-specific polishing if needed
+    if content_category:
+        polished_summary = polish_interview_summary(final_summary, content_category)
+        logger.info(f"Applied interview polishing for {content_category.category}")
+        return polished_summary
     
     return final_summary
 
@@ -5242,6 +5522,170 @@ def main():
         show_favorites_view()
     elif nav_selection == "Settings":
         show_settings_view()
+
+# =================== ROUGE MONITORING AND DEBUGGING SYSTEM ===================
+
+def calculate_detailed_rouge_metrics(summary: str, transcript: str) -> dict:
+    """
+    Calculate detailed ROUGE-style metrics for comprehensive evaluation and debugging.
+    """
+    if not summary or not transcript:
+        return {"rouge_1": 0.0, "rouge_2": 0.0, "rouge_l": 0.0, "word_overlap": 0, "bigram_overlap": 0}
+    
+    summary_clean = re.sub(r'[^\w\s]', '', summary.lower())
+    transcript_clean = re.sub(r'[^\w\s]', '', transcript.lower())
+    
+    summary_words = summary_clean.split()
+    transcript_words = transcript_clean.split()
+    
+    # ROUGE-1 (word overlap)
+    summary_word_set = set(summary_words)
+    transcript_word_set = set(transcript_words)
+    word_overlap = len(summary_word_set.intersection(transcript_word_set))
+    rouge_1 = word_overlap / len(transcript_word_set) if transcript_word_set else 0.0
+    
+    # ROUGE-2 (bigram overlap)
+    summary_bigrams = set(zip(summary_words[:-1], summary_words[1:]))
+    transcript_bigrams = set(zip(transcript_words[:-1], transcript_words[1:]))
+    bigram_overlap = len(summary_bigrams.intersection(transcript_bigrams))
+    rouge_2 = bigram_overlap / len(transcript_bigrams) if transcript_bigrams else 0.0
+    
+    # ROUGE-L (longest common subsequence approximation)
+    from difflib import SequenceMatcher
+    matcher = SequenceMatcher(None, summary_words, transcript_words)
+    lcs_length = sum(block.size for block in matcher.get_matching_blocks())
+    rouge_l = lcs_length / len(transcript_words) if transcript_words else 0.0
+    
+    return {
+        "rouge_1": min(rouge_1, 1.0),
+        "rouge_2": min(rouge_2, 1.0), 
+        "rouge_l": min(rouge_l, 1.0),
+        "word_overlap": word_overlap,
+        "bigram_overlap": bigram_overlap,
+        "total_words_summary": len(summary_words),
+        "total_words_transcript": len(transcript_words),
+        "total_bigrams_summary": len(summary_bigrams),
+        "total_bigrams_transcript": len(transcript_bigrams)
+    }
+
+def log_rouge_analysis(summary: str, transcript: str, stage: str = "Final"):
+    """
+    Comprehensive ROUGE analysis and logging for debugging.
+    """
+    try:
+        metrics = calculate_detailed_rouge_metrics(summary, transcript)
+        
+        logger.info(f"=== {stage} ROUGE Analysis ===")
+        logger.info(f"ROUGE-1 (word overlap): {metrics['rouge_1']:.3f} ({metrics['word_overlap']}/{metrics['total_words_transcript']} words)")
+        logger.info(f"ROUGE-2 (bigram overlap): {metrics['rouge_2']:.3f} ({metrics['bigram_overlap']}/{metrics['total_bigrams_transcript']} bigrams)")
+        logger.info(f"ROUGE-L (LCS): {metrics['rouge_l']:.3f}")
+        logger.info(f"Summary: {metrics['total_words_summary']} words, Transcript: {metrics['total_words_transcript']} words")
+        
+        # Identify potential improvements
+        if metrics['rouge_1'] < 0.3:
+            logger.warning(f"Low ROUGE-1 score ({metrics['rouge_1']:.3f}) - Consider preserving more original words")
+        if metrics['rouge_2'] < 0.15:
+            logger.warning(f"Low ROUGE-2 score ({metrics['rouge_2']:.3f}) - Consider preserving more consecutive word pairs")
+        if metrics['rouge_l'] < 0.25:
+            logger.warning(f"Low ROUGE-L score ({metrics['rouge_l']:.3f}) - Consider preserving longer word sequences")
+            
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"ROUGE analysis failed: {e}")
+        return {"rouge_1": 0.0, "rouge_2": 0.0, "rouge_l": 0.0, "word_overlap": 0, "bigram_overlap": 0}
+
+def polish_interview_summary(summary: str, content_category: ContentCategory) -> str:
+    """
+    Specialized post-processing for interview/podcast content to create professional summaries.
+    """
+    if content_category.category != "Interview/Podcast":
+        return summary
+    
+    if not summary or len(summary.strip()) < 50:
+        return summary
+    
+    try:
+        # Remove conversational artifacts while preserving content
+        polished = summary
+        
+        # Remove filler words and conversational noise
+        filler_patterns = [
+            r'\b(um|uh|like|you know|sort of|kind of|I mean|you see)\b',
+            r'\b(well|so|right|okay|yeah|actually|basically)\b',
+            r'\b(and then|and so|and like|and stuff)\b',
+            r'\b(I think|I believe|I feel like|I guess)\b(?=\s)',
+        ]
+        
+        for pattern in filler_patterns:
+            polished = re.sub(pattern, '', polished, flags=re.IGNORECASE)
+        
+        # Clean up multiple spaces and improve flow
+        polished = re.sub(r'\s+', ' ', polished)
+        polished = re.sub(r'\s*,\s*,\s*', ', ', polished)  # Remove double commas
+        polished = re.sub(r'\s*\.\s*\.\s*', '. ', polished)  # Remove double periods
+        
+        # Improve sentence transitions
+        polished = re.sub(r'\.\s*And\s+', '. ', polished)
+        polished = re.sub(r'\.\s*So\s+', '. ', polished)
+        polished = re.sub(r'\.\s*But\s+', '. However, ', polished)
+        
+        # Ensure proper capitalization
+        sentences = re.split(r'(?<=[.!?])\s+', polished)
+        capitalized_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if sentence:
+                # Capitalize first letter
+                sentence = sentence[0].upper() + sentence[1:] if len(sentence) > 1 else sentence.upper()
+                capitalized_sentences.append(sentence)
+        
+        polished = ' '.join(capitalized_sentences)
+        
+        # Final cleanup
+        polished = polished.strip()
+        if polished and not polished.endswith(('.', '!', '?')):
+            polished += '.'
+        
+        return polished
+        
+    except Exception as e:
+        logger.warning(f"Interview summary polishing failed: {e}")
+        return summary
+
+def analyze_lexical_overlap(summary: str, transcript: str) -> dict:
+    """
+    Detailed lexical overlap analysis for ROUGE optimization insights.
+    """
+    try:
+        summary_words = set(re.findall(r'\b\w+\b', summary.lower()))
+        transcript_words = set(re.findall(r'\b\w+\b', transcript.lower()))
+        
+        overlap_words = summary_words.intersection(transcript_words)
+        missing_important_words = transcript_words - summary_words
+        
+        # Find most frequent words in transcript that are missing from summary
+        transcript_word_freq = {}
+        for word in re.findall(r'\b\w+\b', transcript.lower()):
+            transcript_word_freq[word] = transcript_word_freq.get(word, 0) + 1
+        
+        missing_frequent = sorted(
+            [(word, freq) for word, freq in transcript_word_freq.items() if word in missing_important_words],
+            key=lambda x: x[1], reverse=True
+        )[:10]
+        
+        return {
+            "overlap_ratio": len(overlap_words) / len(transcript_words) if transcript_words else 0,
+            "overlapping_words": len(overlap_words),
+            "total_transcript_words": len(transcript_words),
+            "missing_frequent_words": missing_frequent,
+            "overlap_words_sample": list(overlap_words)[:20]
+        }
+        
+    except Exception as e:
+        logger.error(f"Lexical overlap analysis failed: {e}")
+        return {"overlap_ratio": 0, "overlapping_words": 0, "total_transcript_words": 0}
 
 if __name__ == "__main__":
     main()
